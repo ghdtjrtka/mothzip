@@ -8,6 +8,21 @@ Topics are in `.github/repository-metadata.json`. Repository creation and public
 
 ## Release notes
 
+### 1.2.4
+
+- **A hostile RAR5 dictionary is refused instead of allocated.** The decoder allocates a window of
+  the declared dictionary size, so an archive declaring gigabytes could exhaust memory before
+  writing a byte. `rar50_dictionary_size_limit` is pinned to 512 MiB (a policy ceiling: real
+  archives use 32-64 MiB, and the largest dictionary this tool writes is 64 MiB), applied to
+  extraction, `cat`, `peek` and integrity checking.
+- **RAR integrity checking no longer buffers a whole member.** `test` pins the buffered-decode
+  limit to one 4 MiB filter block, so a large member is decoded through one filter block at a time
+  instead of being buffered whole; `cat` already worked that way.
+- **Package manifests for winget and scoop.** `audit/make_package_manifests.py --package <dir>`
+  writes the three winget files and the scoop manifest from a package directory (version, archive
+  digest and URL come from the package itself, so they cannot drift). Submitting them is a manual
+  step: a pull request against `microsoft/winget-pkgs`, or a bucket commit.
+
 ### 1.2.3
 
 - **One name everywhere: Mothzip.** The Korean name is gone from the installer entry, the Start

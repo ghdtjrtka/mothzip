@@ -1,0 +1,15 @@
+# winget create validate -- manifests; then open the pull request against microsoft/winget-pkgs
+PackageIdentifier: Mothzip.Mothzip
+PackageVersion: 1.2.4
+InstallerType: zip
+NestedInstallerType: portable
+NestedInstallerFiles:
+- RelativeFilePath: mothzip.exe
+  PortableCommandAlias: mothzip
+Installers:
+- Architecture: x64
+  InstallerUrl: https://github.com/ghdtjrtka/mothzip/releases/download/v1.2.4/mothzip-1.2.4-windows-x64.zip
+  InstallerSha256: F6D52E17AC03983064257B8186FAC020499474ED8912A68472D8B2A3CE4031AB
+  Scope: user
+ManifestType: installer
+ManifestVersion: 1.6.0

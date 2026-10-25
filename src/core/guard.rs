@@ -124,6 +124,14 @@ const DOS_RESERVED_NAMES: &[&str] = &[
 ];
 
 /// Check whether a filename or stem matches Windows reserved DOS device names.
+/// Ceiling on a RAR5 compressed member's declared dictionary size.
+///
+/// The decoder allocates a window of the declared size, so a hostile archive could ask for
+/// gigabytes before writing a byte. Real archives stay far below this: RAR5 tools default to
+/// 32-64 MiB, and the largest dictionary this product writes (7z at level 9) is 64 MiB. The
+/// limit is a policy ceiling, not a measurement of any particular file.
+pub const RAR_DICTIONARY_LIMIT_BYTES: u64 = 512 * 1024 * 1024;
+
 pub fn is_reserved_dos_device(stem: &str) -> bool {
     let upper = stem.to_ascii_uppercase();
     DOS_RESERVED_NAMES.contains(&upper.as_str())

@@ -1,0 +1,24 @@
+PackageIdentifier: Mothzip.Mothzip
+PackageVersion: 1.2.4
+PackageLocale: en-US
+Publisher: Mothzip
+PublisherUrl: https://github.com/ghdtjrtka/mothzip
+PackageName: Mothzip
+PackageUrl: https://github.com/ghdtjrtka/mothzip
+License: MIT
+LicenseUrl: https://github.com/ghdtjrtka/mothzip/blob/master/LICENSE
+ShortDescription: Ad-free Windows archive CLI with JSON output for scripts and agents
+Description: >-
+  A single-executable Windows archive tool: ZIP (including AES), 7z, TAR and gzip/zstd/xz/lz4/brotli
+  creation, RAR extraction, ZIP/7z editing, split volumes, SFX, reproducible archives and
+  stdout/stdin streaming. Explorer integration adds a three-item context menu and a double-click
+  browser; the command line reports JSON, uses exit codes 0/1/2 and never prompts.
+Tags:
+- archiver
+- cli
+- zip
+- 7zip
+- tar
+- zstd
+ManifestType: defaultLocale
+ManifestVersion: 1.6.0

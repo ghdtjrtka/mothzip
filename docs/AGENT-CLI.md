@@ -1,6 +1,6 @@
 # Mothzip CLI contract for scripts, CI, and agents
 
-**Version 1.2.3** (Windows 10/11 x64, MIT). This page documents what a program can rely on when it drives `mothzip.exe`: the flags that exist, the JSON on each stream, how failure is signalled, and which integrity guarantees do **not** exist. It is a contract page, not a tutorial.
+**Version 1.2.4** (Windows 10/11 x64, MIT). This page documents what a program can rely on when it drives `mothzip.exe`: the flags that exist, the JSON on each stream, how failure is signalled, and which integrity guarantees do **not** exist. It is a contract page, not a tutorial.
 
 Every command line in sections 1–8 was executed against the shipped build on Windows before it was written; output blocks are real captures, not illustrations. Measured limits are marked **measured**; figures quoted from this repository's perf runs are marked as such, and the CLI additions at the end were run against the same build.
 
@@ -341,6 +341,8 @@ cmd /c "mothzip.exe pack out.zip src --to-stdout > out.zip"
 **`pack --reproducible`.** Entries are sorted by member-name bytes and every timestamp is pinned to `SOURCE_DATE_EPOCH` (0 when unset; ZIP clamps to 1980-01-01). Measured: ZIP, 7z, TAR, TAR.GZ, and TAR.ZST were byte-identical across two runs, and the ZIP stayed byte-identical after a source mtime change; `SOURCE_DATE_EPOCH=1700000000` produced ZIP `date_time` `(2023, 11, 14, 22, 13, 20)`; an invalid value exits 1 with `SOURCE_DATE_EPOCH must be whole seconds since 1970-01-01, got 'not-a-number'`. AES-encrypted archives are excluded from the guarantee because the IV is random — two `--reproducible` runs of the same password-protected ZIP differed.
 
 **TAR+codec `test` now detects corruption.** After one payload byte was flipped, `test` returned exit 1 with `passed: false` for `TAR.GZ`, `TAR.ZST`, `TAR.XZ`, and `TAR.LZ4`, matching `unpack`; see the table and the first bullet in §6.
+
+**A RAR5 dictionary above 512 MiB is refused.** The decoder allocates a window of the declared dictionary size, so an archive asking for gigabytes could exhaust memory before writing a byte; the ceiling is a policy limit (real archives use 32-64 MiB, and the largest dictionary this tool writes is 64 MiB) and it is applied to extraction, `cat`, `peek` and `test`. Integrity checking also streams members above one 4 MiB filter block instead of buffering them.
 
 **RAR `cat` streams with bounded memory.** On large members peak RSS fell from 545.7 MB to **8.9 MB** (−98.4%), and it stayed flat at 8.87–9.75 MB from 64 KiB to 512 MiB members.
 

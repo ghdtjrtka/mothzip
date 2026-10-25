@@ -638,6 +638,8 @@ fn extract_rar_archive(
         }
         options.max_total_output_bytes = Some(max_bytes);
         options.max_member_output_bytes = Some(max_bytes);
+        // A declared dictionary above the policy ceiling is refused before any output is opened.
+        options.rar50_dictionary_size_limit = Some(super::guard::RAR_DICTIONARY_LIMIT_BYTES);
 
         let volumes = super::format::find_volume_files(archive_path);
         if volumes.len() > 1 {

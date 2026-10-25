@@ -538,6 +538,9 @@ fn cat_rar_file<W: Write + 'static>(
     options.max_member_output_bytes = Some(max_bytes);
     options.max_total_output_bytes = Some(max_bytes);
     options.rar50_buffered_decode_limit = Some(RAR_STREAM_DECODE_LIMIT);
+    // The decoder allocates a window of the declared dictionary size, so a hostile archive could
+    // ask for gigabytes before writing a byte; the policy ceiling refuses that admission.
+    options.rar50_dictionary_size_limit = Some(super::guard::RAR_DICTIONARY_LIMIT_BYTES);
 
     let volumes = super::format::find_volume_files(archive_path);
     let archives = volumes
@@ -709,6 +712,10 @@ pub fn test_archive_integrity(
             let mut options = rars::ArchiveReadOptions::default();
             options.max_member_output_bytes = Some(max_bytes);
             options.max_total_output_bytes = Some(max_bytes);
+            options.rar50_dictionary_size_limit = Some(super::guard::RAR_DICTIONARY_LIMIT_BYTES);
+            // Integrity checking does not need the whole member in memory: above one filter block
+            // rars streams it, which keeps the peak flat instead of tracking the member size.
+            options.rar50_buffered_decode_limit = Some(RAR_STREAM_DECODE_LIMIT);
             if let Some(p) = password {
                 options.password = Some(p.as_bytes());
             }
