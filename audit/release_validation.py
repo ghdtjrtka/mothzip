@@ -15,27 +15,23 @@ base=round3['base']; ROOT=base['ROOT']; BINARY=base['BINARY']
 fixture_dir,archive,invoke,record=(base[n] for n in ('fixture_dir','archive','invoke','record'))
 kernel=round3['kernel']
 
-# The second rename fails after the first file has already been installed: require whole-set rollback.
+# The second target is refused after the first file has already been installed: require
+# whole-set rollback. A directory at the destination makes the refusal deterministic; the
+# earlier version raced a thread to lock a staging file and missed the window on CI.
 d=fixture_dir('release-late-commit-failure')
 out=d/'out'; out.mkdir()
-(out/'first.txt').write_bytes(b'FIRST ORIGINAL'); (out/'second.txt').write_bytes(b'SECOND ORIGINAL')
-a=d/'attack.zip'; archive(a,[('first.txt',b'CHANGED'),('second.txt',os.urandom(8*1024*1024))])
-stop=threading.Event(); locked=threading.Event(); handles=[]
-def hold_second():
-    deadline=time.monotonic()+10
-    while not stop.is_set() and time.monotonic()<deadline:
-        for p in out.glob('.mothzip_stage_*/1.tmp'):
-            h=kernel.CreateFileW(str(p),0x80000000,3,None,3,0,None)
-            if h not in (None,ctypes.c_void_p(-1).value):
-                handles.append(h); locked.set(); return
-        stop.wait(0.001)
-t=threading.Thread(target=hold_second);t.start()
-try:
-    call=invoke('unpack',a,'-o',out)
-finally:
-    stop.set();t.join(timeout=11)
-    for h in handles: kernel.CloseHandle(h)
-record(d.name,[call],lock_acquired=locked.is_set(),first_preserved=(out/'first.txt').read_bytes()==b'FIRST ORIGINAL',second_preserved=(out/'second.txt').read_bytes()==b'SECOND ORIGINAL')
+(out/'first.txt').write_bytes(b'FIRST ORIGINAL')
+(out/'second.txt').mkdir()
+(out/'second.txt'/'inside.txt').write_bytes(b'SECOND ORIGINAL')
+a=d/'attack.zip'; archive(a,[('first.txt',b'CHANGED'),('second.txt',b'CHANGED')])
+call=invoke('unpack',a,'-o',out)
+staging=list(out.glob('.mothzip_stage_*'))
+record(d.name,[call],
+    first_preserved=(out/'first.txt').read_bytes()==b'FIRST ORIGINAL',
+    second_preserved=(out/'second.txt'/'inside.txt').read_bytes()==b'SECOND ORIGINAL',
+    no_staging=not staging,
+    refused=call.get('exit_code')==1)
+
 
 for ext in ('zip','tar'):
     d=fixture_dir('release-unicode-display-'+ext)
@@ -253,7 +249,7 @@ for test in base['results']:
     elif name.startswith('round3-unicode-case-collision-'): require(code==0 and o['output_files']==2 and sorted(o['output_contents'])==['FIRST','SECOND'],name,'Unicode member lost')
     elif name=='round3-extraction-rename-locked': require(code==1 and o['stage_lock_acquired'] and o['original_preserved'],name,'rename lock lost original')
     elif name=='round3-cp949-cat': require(all(c['exit_code']==0 for c in calls) and o['cat_content']==o['requested_content'],name,'legacy name lookup failed')
-    elif name=='release-late-commit-failure': require(code==1 and o['lock_acquired'] and o['first_preserved'] and o['second_preserved'],name,'whole-set rollback failed')
+    elif name=='release-late-commit-failure': require(code==1 and o['refused'] and o['first_preserved'] and o['second_preserved'] and o['no_staging'],name,'whole-set rollback failed')
     elif name.startswith('release-unicode-display-'): require(code==0 and o['valid_json'],name,'Unicode slicing or JSON failure')
     elif name=='release-peek-long-root': require(code==0 and o['stdout_bytes']<1000,name,'root name unbounded')
     elif name=='release-gzip-limit-zero': require(code==0 and o['tree_items']==0 and o['truncated_items']==1,name,'count limit ignored')
