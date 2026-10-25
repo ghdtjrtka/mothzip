@@ -26,9 +26,20 @@ fn main() -> ExitCode {
     let cli = Cli::parse();
 
     let result = match &cli.command {
-        Commands::SmartUnpack { archive, out } => {
+        Commands::SmartUnpack {
+            archive,
+            out,
+            password,
+            to_folder,
+        } => {
             let out_dir = resolve_output_dir(archive, out);
-            match core::extract::extract_archive(archive, &out_dir, true) {
+            match core::extract::extract_archive(
+                archive,
+                &out_dir,
+                true,
+                *to_folder,
+                password.as_deref(),
+            ) {
                 Ok(summary) => {
                     report_extract(&summary, cli.json, cli.quiet);
                     Ok(())
@@ -36,9 +47,20 @@ fn main() -> ExitCode {
                 Err(e) => Err(e),
             }
         }
-        Commands::Unpack { archive, out } => {
+        Commands::Unpack {
+            archive,
+            out,
+            password,
+            to_folder,
+        } => {
             let out_dir = resolve_output_dir(archive, out);
-            match core::extract::extract_archive(archive, &out_dir, false) {
+            match core::extract::extract_archive(
+                archive,
+                &out_dir,
+                false,
+                *to_folder,
+                password.as_deref(),
+            ) {
                 Ok(summary) => {
                     report_extract(&summary, cli.json, cli.quiet);
                     Ok(())
@@ -46,15 +68,23 @@ fn main() -> ExitCode {
                 Err(e) => Err(e),
             }
         }
-        Commands::Pack { output, sources } => {
-            match core::pack::pack_archive(output, sources) {
+        Commands::Pack { output, sources } => match core::pack::pack_archive(output, sources) {
+            Ok(summary) => {
+                report_pack(&summary, cli.json, cli.quiet);
+                Ok(())
+            }
+            Err(e) => Err(e),
+        },
+        Commands::PackAuto { source } => {
+            let dest = core::pack::determine_auto_pack_dest(source);
+            match core::pack::pack_archive(&dest, std::slice::from_ref(source)) {
                 Ok(summary) => {
                     report_pack(&summary, cli.json, cli.quiet);
                     Ok(())
                 }
                 Err(e) => Err(e),
             }
-        }
+        },
         Commands::Peek {
             archive,
             depth,
@@ -66,9 +96,18 @@ fn main() -> ExitCode {
             }
             Err(e) => Err(e),
         },
-        Commands::Cat { archive, path } => {
+        Commands::Cat {
+            archive,
+            path,
+            password,
+        } => {
             let mut stdout = io::stdout().lock();
-            let res = core::inspect::cat_archive_file(archive, path, &mut stdout);
+            let res = core::inspect::cat_archive_file(
+                archive,
+                path,
+                password.as_deref(),
+                &mut stdout,
+            );
             let _ = stdout.flush();
             res
         }

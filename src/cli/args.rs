@@ -32,6 +32,12 @@ pub enum Commands {
         /// Destination directory (defaults to archive's parent folder)
         #[arg(short, long)]
         out: Option<PathBuf>,
+        /// Optional password for encrypted archives
+        #[arg(short, long)]
+        password: Option<String>,
+        /// Force extracting into a dedicated subfolder named after the archive
+        #[arg(long)]
+        to_folder: bool,
     },
 
     /// Direct unpack: extracts directly into specified destination
@@ -42,6 +48,12 @@ pub enum Commands {
         /// Destination directory (defaults to current directory)
         #[arg(short, long)]
         out: Option<PathBuf>,
+        /// Optional password for encrypted archives
+        #[arg(short, long)]
+        password: Option<String>,
+        /// Force extracting into a dedicated subfolder named after the archive
+        #[arg(long)]
+        to_folder: bool,
     },
 
     /// Pack files or directories into a .zip archive
@@ -52,6 +64,13 @@ pub enum Commands {
         /// Files or directories to compress
         #[arg(required = true)]
         sources: Vec<PathBuf>,
+    },
+
+    /// Automatically compress a single file or directory to <name>.zip in the same directory
+    #[command(name = "pack-auto")]
+    PackAuto {
+        /// Source file or directory to compress
+        source: PathBuf,
     },
 
     /// Fast token-saving inspection of archive layout without extracting (Agentic Peek)
@@ -74,6 +93,9 @@ pub enum Commands {
         archive: PathBuf,
         /// Relative path of the file inside the archive
         path: String,
+        /// Optional password for encrypted archives
+        #[arg(short, long)]
+        password: Option<String>,
     },
 
     /// Register Windows Explorer right-click context menu (Smart Unpack, Pack)

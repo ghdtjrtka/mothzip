@@ -37,12 +37,17 @@ pub fn is_reserved_dos_device(stem: &str) -> bool {
 /// 3. Windows DOS device names (`CON`, `PRN`, `AUX`, `NUL`, `COM1..9`, `LPT1..9`)
 /// 4. Trailing dots and spaces which alter Windows path resolution
 pub fn sanitize_entry_path(base_dir: &Path, raw_path: &str) -> Result<PathBuf, GuardError> {
-    // 1. Check for Alternate Data Stream (ADS)
+    // 1. Check for Alternate Data Stream (ADS) and null bytes
     if raw_path.contains(':') {
         return Err(GuardError::AlternateDataStream(raw_path.to_string()));
     }
+    if raw_path.contains('\0') {
+        return Err(GuardError::IllegalPathCharacters(raw_path.to_string()));
+    }
 
-    let p = Path::new(raw_path);
+    // Normalize: strip leading slashes or dots that indicate relative/root positioning
+    let trimmed = raw_path.trim_start_matches(['/', '\\']);
+    let p = Path::new(trimmed);
 
     // 2. Check for malicious components
     for comp in p.components() {
@@ -62,11 +67,12 @@ pub fn sanitize_entry_path(base_dir: &Path, raw_path: &str) -> Result<PathBuf, G
                 }
 
                 // 4. Prohibit DOS device names (e.g. con, con.txt, aux.tar.gz)
-                let stem = Path::new(&*comp_str)
+                let base_name = comp_str.split('.').next().unwrap_or("");
+                let file_stem = Path::new(&*comp_str)
                     .file_stem()
                     .and_then(|s| s.to_str())
                     .unwrap_or("");
-                if is_reserved_dos_device(stem) {
+                if is_reserved_dos_device(base_name) || is_reserved_dos_device(file_stem) {
                     return Err(GuardError::ReservedDeviceName(raw_path.to_string()));
                 }
             }
@@ -81,8 +87,8 @@ pub fn sanitize_entry_path(base_dir: &Path, raw_path: &str) -> Result<PathBuf, G
         }
     }
 
-    // Double check directory containment
-    if !dest.starts_with(base_dir) {
+    // Double check directory containment and non-empty target
+    if !dest.starts_with(base_dir) || dest == base_dir {
         return Err(GuardError::ZipSlip(raw_path.to_string()));
     }
 
@@ -108,8 +114,9 @@ mod tests {
         let base = Path::new("C:\\safe\\extract");
         assert!(sanitize_entry_path(base, "../evil.exe").is_err());
         assert!(sanitize_entry_path(base, "sub/../../evil.exe").is_err());
-        assert!(sanitize_entry_path(base, "/etc/shadow").is_err());
         assert!(sanitize_entry_path(base, "C:\\Windows\\system32").is_err());
+        assert!(sanitize_entry_path(base, "/").is_err());
+        assert!(sanitize_entry_path(base, "///").is_err());
     }
 
     #[test]
@@ -117,6 +124,7 @@ mod tests {
         let base = Path::new("C:\\safe\\extract");
         assert!(sanitize_entry_path(base, "file.txt:hidden.exe").is_err());
         assert!(sanitize_entry_path(base, "folder/sub:stream").is_err());
+        assert!(sanitize_entry_path(base, "folder/evil\0file.txt").is_err());
     }
 
     #[test]
@@ -124,6 +132,7 @@ mod tests {
         let base = Path::new("C:\\safe\\extract");
         assert!(sanitize_entry_path(base, "con").is_err());
         assert!(sanitize_entry_path(base, "CON.txt").is_err());
+        assert!(sanitize_entry_path(base, "con.tar.gz").is_err());
         assert!(sanitize_entry_path(base, "folder/aux").is_err());
         assert!(sanitize_entry_path(base, "folder/NUL.dat").is_err());
         assert!(sanitize_entry_path(base, "com1/file.txt").is_err());
@@ -142,5 +151,9 @@ mod tests {
         let base = Path::new("C:\\safe\\extract");
         let safe = sanitize_entry_path(base, "folder/sub/file.txt").unwrap();
         assert_eq!(safe, base.join("folder").join("sub").join("file.txt"));
+
+        // Leading slashes should be normalized safely
+        let safe_leading = sanitize_entry_path(base, "/folder/sub/file.txt").unwrap();
+        assert_eq!(safe_leading, base.join("folder").join("sub").join("file.txt"));
     }
 }

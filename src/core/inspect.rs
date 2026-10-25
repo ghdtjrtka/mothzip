@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
+use zip::result::ZipError;
 use zip::ZipArchive;
 
 use super::smart::plan_smart_unpack;
@@ -110,6 +111,7 @@ pub fn peek_archive(
 pub fn cat_archive_file<W: Write>(
     archive_path: &Path,
     target_entry_path: &str,
+    password: Option<&str>,
     writer: &mut W,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let file = File::open(archive_path)?;
@@ -117,31 +119,41 @@ pub fn cat_archive_file<W: Write>(
 
     let target_normalized = target_entry_path.replace('\\', "/");
 
-    // Try exact match first
     for i in 0..archive.len() {
-        let mut entry = archive.by_index(i)?;
-        let name_normalized = super::encoding::decode_entry_name(entry.name_raw()).replace('\\', "/");
+        let name_normalized = {
+            let entry = archive.by_index(i)?;
+            super::encoding::decode_entry_name(entry.name_raw()).replace('\\', "/")
+        };
 
         if name_normalized == target_normalized
             || name_normalized.trim_start_matches('/') == target_normalized.trim_start_matches('/')
+            || name_normalized.eq_ignore_ascii_case(&target_normalized)
         {
+            let mut entry = match password {
+                Some(pass) => match archive.by_index_decrypt(i, pass.as_bytes()) {
+                    Ok(e) => e,
+                    Err(ZipError::UnsupportedArchive(msg)) => {
+                        return Err(format!("Decryption failed: {}", msg).into());
+                    }
+                    Err(e) => return Err(Box::new(e)),
+                },
+                None => match archive.by_index(i) {
+                    Ok(e) => e,
+                    Err(ZipError::UnsupportedArchive(msg))
+                        if msg.contains("Password") || msg.contains("encrypted") =>
+                    {
+                        return Err(
+                            "File is password-protected. Please supply --password <PASS>".into(),
+                        );
+                    }
+                    Err(e) => return Err(Box::new(e)),
+                },
+            };
+
             if entry.is_dir() {
                 return Err(format!("'{}' is a directory, not a file", target_entry_path).into());
             }
-            std::io::copy(&mut entry, writer)?;
-            return Ok(());
-        }
-    }
 
-    // Try case-insensitive fallback
-    for i in 0..archive.len() {
-        let mut entry = archive.by_index(i)?;
-        let name_normalized = super::encoding::decode_entry_name(entry.name_raw()).replace('\\', "/");
-
-        if name_normalized.eq_ignore_ascii_case(&target_normalized) {
-            if entry.is_dir() {
-                return Err(format!("'{}' is a directory, not a file", target_entry_path).into());
-            }
             std::io::copy(&mut entry, writer)?;
             return Ok(());
         }
