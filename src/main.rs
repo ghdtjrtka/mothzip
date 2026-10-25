@@ -165,6 +165,16 @@ fn main() -> ExitCode {
             }
 
             let _ = stdout.flush();
+
+            // Treat broken pipe (e.g. piped to head, findstr, or stopped agent stream) as graceful exit
+            if let Err(ref e) = res {
+                if let Some(io_err) = e.downcast_ref::<io::Error>() {
+                    if io_err.kind() == io::ErrorKind::BrokenPipe {
+                        return ExitCode::SUCCESS;
+                    }
+                }
+            }
+
             res
         }
         Commands::Register => shell::registry::register_context_menu(),

@@ -21,7 +21,7 @@ const DOS_RESERVED_NAMES: &[&str] = &[
     "CON", "PRN", "AUX", "NUL",
     "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
     "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
-    "CONIN$", "CONOUT$",
+    "CONIN$", "CONOUT$", "CLOCK$",
 ];
 
 /// Check whether a filename or stem matches Windows reserved DOS device names.
@@ -34,14 +34,15 @@ pub fn is_reserved_dos_device(stem: &str) -> bool {
 /// Defends against:
 /// 1. Zip-Slip (`..`, root dir, prefix)
 /// 2. NTFS Alternate Data Streams (`:`)
-/// 3. Windows DOS device names (`CON`, `PRN`, `AUX`, `NUL`, `COM1..9`, `LPT1..9`)
+/// 3. Windows DOS device names (`CON`, `PRN`, `AUX`, `NUL`, `COM1..9`, `LPT1..9`, `CLOCK$`)
 /// 4. Trailing dots and spaces which alter Windows path resolution
+/// 5. Cross-platform invalid characters (`<`, `>`, `"`, `|`, `?`, `*`) sanitized to `_`
 pub fn sanitize_entry_path(base_dir: &Path, raw_path: &str) -> Result<PathBuf, GuardError> {
-    // 1. Check for Alternate Data Stream (ADS) and null bytes
+    // 1. Check for Alternate Data Stream (ADS) and ASCII control characters
     if raw_path.contains(':') {
         return Err(GuardError::AlternateDataStream(raw_path.to_string()));
     }
-    if raw_path.contains('\0') {
+    if raw_path.chars().any(|c| (c as u32) < 0x20) {
         return Err(GuardError::IllegalPathCharacters(raw_path.to_string()));
     }
 
@@ -49,7 +50,7 @@ pub fn sanitize_entry_path(base_dir: &Path, raw_path: &str) -> Result<PathBuf, G
     let trimmed = raw_path.trim_start_matches(['/', '\\']);
     let p = Path::new(trimmed);
 
-    // 2. Check for malicious components
+    // 2. Check each component for traversal, illegal chars, and DOS devices
     for comp in p.components() {
         match comp {
             Component::ParentDir => {
@@ -59,16 +60,25 @@ pub fn sanitize_entry_path(base_dir: &Path, raw_path: &str) -> Result<PathBuf, G
                 return Err(GuardError::ZipSlip(raw_path.to_string()));
             }
             Component::Normal(comp_os) => {
-                let comp_str = comp_os.to_string_lossy();
+                let comp_raw = comp_os.to_string_lossy();
+
+                // Sanitize invalid cross-platform filename characters: < > " | ? * -> _
+                let comp_str: String = comp_raw
+                    .chars()
+                    .map(|c| match c {
+                        '<' | '>' | '"' | '|' | '?' | '*' => '_',
+                        _ => c,
+                    })
+                    .collect();
 
                 // 3. Prohibit trailing dots or spaces in Windows paths
                 if comp_str.ends_with('.') || comp_str.ends_with(' ') {
                     return Err(GuardError::IllegalPathCharacters(raw_path.to_string()));
                 }
 
-                // 4. Prohibit DOS device names (e.g. con, con.txt, aux.tar.gz)
+                // 4. Prohibit DOS device names (e.g. con, con.txt, aux.tar.gz, clock$)
                 let base_name = comp_str.split('.').next().unwrap_or("");
-                let file_stem = Path::new(&*comp_str)
+                let file_stem = Path::new(&comp_str)
                     .file_stem()
                     .and_then(|s| s.to_str())
                     .unwrap_or("");
@@ -83,7 +93,15 @@ pub fn sanitize_entry_path(base_dir: &Path, raw_path: &str) -> Result<PathBuf, G
     let mut dest = base_dir.to_path_buf();
     for comp in p.components() {
         if let Component::Normal(c) = comp {
-            dest.push(c);
+            let sanitized: String = c
+                .to_string_lossy()
+                .chars()
+                .map(|ch| match ch {
+                    '<' | '>' | '"' | '|' | '?' | '*' => '_',
+                    _ => ch,
+                })
+                .collect();
+            dest.push(sanitized);
         }
     }
 
@@ -136,6 +154,8 @@ mod tests {
         assert!(sanitize_entry_path(base, "folder/aux").is_err());
         assert!(sanitize_entry_path(base, "folder/NUL.dat").is_err());
         assert!(sanitize_entry_path(base, "com1/file.txt").is_err());
+        assert!(sanitize_entry_path(base, "clock$").is_err());
+        assert!(sanitize_entry_path(base, "sub/CLOCK$.txt").is_err());
     }
 
     #[test]
@@ -144,6 +164,7 @@ mod tests {
         assert!(sanitize_entry_path(base, "folder./file.txt").is_err());
         assert!(sanitize_entry_path(base, "folder /file.txt").is_err());
         assert!(sanitize_entry_path(base, "file.txt.").is_err());
+        assert!(sanitize_entry_path(base, "folder/file\x1f.txt").is_err());
     }
 
     #[test]
@@ -155,5 +176,9 @@ mod tests {
         // Leading slashes should be normalized safely
         let safe_leading = sanitize_entry_path(base, "/folder/sub/file.txt").unwrap();
         assert_eq!(safe_leading, base.join("folder").join("sub").join("file.txt"));
+
+        // Cross-platform illegal characters should be sanitized to '_'
+        let cross_platform = sanitize_entry_path(base, "folder/report<draft>?*|.pdf").unwrap();
+        assert_eq!(cross_platform, base.join("folder").join("report_draft____.pdf"));
     }
 }
