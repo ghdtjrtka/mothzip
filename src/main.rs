@@ -12,18 +12,85 @@ mod shell;
 use cli::args::{Cli, Commands};
 use cli::output::{report_extract, report_pack, report_peek};
 
+const SUBCOMMANDS: &[&str] = &[
+    "smart-unpack",
+    "unpack",
+    "pack",
+    "pack-auto",
+    "peek",
+    "cat",
+    "register",
+    "unregister",
+    "help",
+];
+
+/// Normalize command line arguments:
+/// If the user passes a file or directory directly without a subcommand
+/// (e.g. `mothzip archive.zip`, or Windows Explorer drag-and-drop onto mothzip.exe),
+/// automatically route to `smart-unpack` for .zip files, or `pack-auto` for directories/other files.
+fn normalize_args(raw_args: Vec<String>) -> Vec<String> {
+    if raw_args.len() <= 1 {
+        return raw_args;
+    }
+
+    // Find the first non-flag argument after the executable path
+    let mut subcmd_idx = None;
+    for (i, arg) in raw_args.iter().enumerate().skip(1) {
+        if !arg.starts_with('-') {
+            subcmd_idx = Some(i);
+            break;
+        }
+    }
+
+    if let Some(idx) = subcmd_idx {
+        let first_arg = &raw_args[idx];
+        if !SUBCOMMANDS.contains(&first_arg.as_str()) {
+            let is_zip = first_arg.ends_with(".zip")
+                || first_arg.ends_with(".ZIP")
+                || Path::new(first_arg)
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("zip"));
+
+            let default_cmd = if is_zip { "smart-unpack" } else { "pack-auto" };
+            let mut new_args = raw_args;
+            new_args.insert(idx, default_cmd.to_string());
+            return new_args;
+        }
+    }
+
+    raw_args
+}
+
+/// Check whether the process was spawned directly by Windows Explorer (e.g. double-click)
+/// rather than an existing interactive console shell (cmd, powershell, or agent runner).
+fn is_standalone_console() -> bool {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetConsoleProcessList(lpdwProcessList: *mut u32, dwProcessCount: u32) -> u32;
+    }
+    let mut process_list = [0u32; 2];
+    let count = unsafe { GetConsoleProcessList(process_list.as_mut_ptr(), 2) };
+    count == 1
+}
+
 fn main() -> ExitCode {
-    let args: Vec<String> = env::args().collect();
+    let raw_args: Vec<String> = env::args().collect();
 
     // If launched by double-clicking without arguments, show help
-    if args.len() <= 1 {
+    if raw_args.len() <= 1 {
         println!("mothzip v0.1.0 - Ultra-lightweight ad-free archiver");
         println!("Run 'mothzip register' to add right-click context menu in Windows Explorer.");
         println!("Run 'mothzip --help' for full CLI commands.");
+        if is_standalone_console() {
+            println!("\nPress Enter to exit...");
+            let mut dummy = String::new();
+            let _ = io::stdin().read_line(&mut dummy);
+        }
         return ExitCode::SUCCESS;
     }
 
-    let cli = Cli::parse();
+    let normalized = normalize_args(raw_args);
+    let cli = Cli::parse_from(normalized);
 
     let result = match &cli.command {
         Commands::SmartUnpack {
@@ -189,6 +256,11 @@ fn main() -> ExitCode {
                 eprintln!("{}", json_err);
             } else {
                 eprintln!("Error: {}", err);
+                if is_standalone_console() {
+                    eprintln!("\nPress Enter to exit...");
+                    let mut dummy = String::new();
+                    let _ = io::stdin().read_line(&mut dummy);
+                }
             }
             ExitCode::FAILURE
         }
@@ -230,4 +302,39 @@ fn prompt_password(archive_name: &str, is_json: bool) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_normalize_args_zip_to_smart_unpack() {
+        let raw = vec!["mothzip".into(), "archive.zip".into()];
+        let normalized = normalize_args(raw);
+        assert_eq!(normalized, vec!["mothzip", "smart-unpack", "archive.zip"]);
+
+        let raw_with_flags = vec!["mothzip".into(), "archive.zip".into(), "-o".into(), "out".into()];
+        let normalized = normalize_args(raw_with_flags);
+        assert_eq!(normalized, vec!["mothzip", "smart-unpack", "archive.zip", "-o", "out"]);
+    }
+
+    #[test]
+    fn test_normalize_args_dir_to_pack_auto() {
+        let raw = vec!["mothzip".into(), "my_folder".into()];
+        let normalized = normalize_args(raw);
+        assert_eq!(normalized, vec!["mothzip", "pack-auto", "my_folder"]);
+    }
+
+    #[test]
+    fn test_normalize_args_preserves_explicit_subcommands() {
+        let raw_pack = vec!["mothzip".into(), "pack".into(), "out.zip".into(), "src".into()];
+        assert_eq!(normalize_args(raw_pack.clone()), raw_pack);
+
+        let raw_peek = vec!["mothzip".into(), "peek".into(), "out.zip".into()];
+        assert_eq!(normalize_args(raw_peek.clone()), raw_peek);
+
+        let raw_help = vec!["mothzip".into(), "--help".into()];
+        assert_eq!(normalize_args(raw_help.clone()), raw_help);
+    }
 }

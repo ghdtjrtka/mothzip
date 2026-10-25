@@ -17,41 +17,50 @@ pub fn generate_reg_content(exe_path: &Path) -> String {
 ; 1. Right-click on .zip archives (Direct Extension)\r\n\
 [HKEY_CURRENT_USER\\Software\\Classes\\.zip\\shell\\MothZip.SmartUnpack]\r\n\
 @=\"알아서 풀기 (&MothZip)\"\r\n\
-\"Icon\"=\"\\\"{exe_str}\\\",0\"\r\n\r\n\
+\"Icon\"=\"\\\"{exe_str}\\\",0\"\r\n\
+\"MultiSelectModel\"=\"Player\"\r\n\r\n\
 [HKEY_CURRENT_USER\\Software\\Classes\\.zip\\shell\\MothZip.SmartUnpack\\command]\r\n\
 @=\"\\\"{exe_str}\\\" smart-unpack \\\"%1\\\"\"\r\n\r\n\
 [HKEY_CURRENT_USER\\Software\\Classes\\.zip\\shell\\MothZip.UnpackHere]\r\n\
-@=\"여기에 풀기\"\r\n\r\n\
+@=\"여기에 풀기\"\r\n\
+\"MultiSelectModel\"=\"Player\"\r\n\r\n\
 [HKEY_CURRENT_USER\\Software\\Classes\\.zip\\shell\\MothZip.UnpackHere\\command]\r\n\
 @=\"\\\"{exe_str}\\\" unpack \\\"%1\\\"\"\r\n\r\n\
 [HKEY_CURRENT_USER\\Software\\Classes\\.zip\\shell\\MothZip.UnpackFolder]\r\n\
-@=\"각각 폴더에 풀기\"\r\n\r\n\
+@=\"각각 폴더에 풀기\"\r\n\
+\"MultiSelectModel\"=\"Player\"\r\n\r\n\
 [HKEY_CURRENT_USER\\Software\\Classes\\.zip\\shell\\MothZip.UnpackFolder\\command]\r\n\
 @=\"\\\"{exe_str}\\\" unpack \\\"%1\\\" --to-folder\"\r\n\r\n\
 ; 2. Right-click on .zip archives (SystemFileAssociations for Windows 10/11 Explorer)\r\n\
 [HKEY_CURRENT_USER\\Software\\Classes\\SystemFileAssociations\\.zip\\shell\\MothZip.SmartUnpack]\r\n\
 @=\"알아서 풀기 (&MothZip)\"\r\n\
-\"Icon\"=\"\\\"{exe_str}\\\",0\"\r\n\r\n\
+\"Icon\"=\"\\\"{exe_str}\\\",0\"\r\n\
+\"MultiSelectModel\"=\"Player\"\r\n\r\n\
 [HKEY_CURRENT_USER\\Software\\Classes\\SystemFileAssociations\\.zip\\shell\\MothZip.SmartUnpack\\command]\r\n\
 @=\"\\\"{exe_str}\\\" smart-unpack \\\"%1\\\"\"\r\n\r\n\
 [HKEY_CURRENT_USER\\Software\\Classes\\SystemFileAssociations\\.zip\\shell\\MothZip.UnpackHere]\r\n\
-@=\"여기에 풀기\"\r\n\r\n\
+@=\"여기에 풀기\"\r\n\
+\"MultiSelectModel\"=\"Player\"\r\n\r\n\
 [HKEY_CURRENT_USER\\Software\\Classes\\SystemFileAssociations\\.zip\\shell\\MothZip.UnpackHere\\command]\r\n\
 @=\"\\\"{exe_str}\\\" unpack \\\"%1\\\"\"\r\n\r\n\
 [HKEY_CURRENT_USER\\Software\\Classes\\SystemFileAssociations\\.zip\\shell\\MothZip.UnpackFolder]\r\n\
-@=\"각각 폴더에 풀기\"\r\n\r\n\
+@=\"각각 폴더에 풀기\"\r\n\
+\"MultiSelectModel\"=\"Player\"\r\n\r\n\
 [HKEY_CURRENT_USER\\Software\\Classes\\SystemFileAssociations\\.zip\\shell\\MothZip.UnpackFolder\\command]\r\n\
 @=\"\\\"{exe_str}\\\" unpack \\\"%1\\\" --to-folder\"\r\n\r\n\
-; 3. Right-click on any single file (pack to <name>.zip)\r\n\
+; 3. Right-click on any single file (pack to <name>.zip, hides on .zip to avoid menu clutter)\r\n\
 [HKEY_CURRENT_USER\\Software\\Classes\\*\\shell\\MothZip.Pack]\r\n\
 @=\"ZIP으로 압축 (&MothZip)\"\r\n\
-\"Icon\"=\"\\\"{exe_str}\\\",0\"\r\n\r\n\
+\"Icon\"=\"\\\"{exe_str}\\\",0\"\r\n\
+\"AppliesTo\"=\"System.FileExtension:<>\\\".zip\\\"\"\r\n\
+\"MultiSelectModel\"=\"Player\"\r\n\r\n\
 [HKEY_CURRENT_USER\\Software\\Classes\\*\\shell\\MothZip.Pack\\command]\r\n\
 @=\"\\\"{exe_str}\\\" pack-auto \\\"%1\\\"\"\r\n\r\n\
 ; 4. Right-click on folders (pack to <folder>.zip)\r\n\
 [HKEY_CURRENT_USER\\Software\\Classes\\Directory\\shell\\MothZip.Pack]\r\n\
 @=\"ZIP으로 압축 (&MothZip)\"\r\n\
-\"Icon\"=\"\\\"{exe_str}\\\",0\"\r\n\r\n\
+\"Icon\"=\"\\\"{exe_str}\\\",0\"\r\n\
+\"MultiSelectModel\"=\"Player\"\r\n\r\n\
 [HKEY_CURRENT_USER\\Software\\Classes\\Directory\\shell\\MothZip.Pack\\command]\r\n\
 @=\"\\\"{exe_str}\\\" pack-auto \\\"%1\\\"\"\r\n\r\n\
 ; 5. Windows Installed Application Registry (shows in Settings / Control Panel with icon)\r\n\
@@ -64,7 +73,10 @@ pub fn generate_reg_content(exe_path: &Path) -> String {
 \"UninstallString\"=\"\\\"{exe_str}\\\" unregister\"\r\n\
 \"QuietUninstallString\"=\"\\\"{exe_str}\\\" unregister\"\r\n\
 \"HelpLink\"=\"https://github.com/mothzip/mothzip\"\r\n\
-\"Comments\"=\"초경량 무광고 에이전틱 압축 프로그램\"\r\n\r\n\
+\"Comments\"=\"초경량 무광고 에이전틱 압축 프로그램\"\r\n\
+\"EstimatedSize\"=dword:00000640\r\n\
+\"NoModify\"=dword:00000001\r\n\
+\"NoRepair\"=dword:00000001\r\n\r\n\
 ; 6. App Paths (Run dialog / Win+R -> mothzip)\r\n\
 [HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\App Paths\\mothzip.exe]\r\n\
 @=\"\\\"{exe_str}\\\"\"\r\n\
@@ -263,5 +275,7 @@ mod tests {
         assert!(content.contains("pack-auto"));
         assert!(content.contains("Uninstall\\MothZip"));
         assert!(content.contains("App Paths\\mothzip.exe"));
+        assert!(content.contains("MultiSelectModel"));
+        assert!(content.contains("AppliesTo"));
     }
 }

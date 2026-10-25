@@ -10,6 +10,7 @@ extern "system" {
     ) -> i32;
 }
 
+const CP_ACP: u32 = 0;
 const CP949: u32 = 949;
 const MB_ERR_INVALID_CHARS: u32 = 0x00000008;
 
@@ -64,48 +65,61 @@ pub fn compose_hangul_nfc(s: &str) -> String {
     result
 }
 
+/// Attempt to decode raw bytes with a specific Windows code page using strict validation.
+unsafe fn try_decode_codepage(codepage: u32, raw_bytes: &[u8]) -> Option<String> {
+    let required_len = MultiByteToWideChar(
+        codepage,
+        MB_ERR_INVALID_CHARS,
+        raw_bytes.as_ptr(),
+        raw_bytes.len() as i32,
+        std::ptr::null_mut(),
+        0,
+    );
+
+    if required_len > 0 {
+        let mut wide_buf = vec![0u16; required_len as usize];
+        let converted = MultiByteToWideChar(
+            codepage,
+            MB_ERR_INVALID_CHARS,
+            raw_bytes.as_ptr(),
+            raw_bytes.len() as i32,
+            wide_buf.as_mut_ptr(),
+            required_len,
+        );
+
+        if converted > 0 {
+            return Some(String::from_utf16_lossy(&wide_buf));
+        }
+    }
+    None
+}
+
 /// Decode raw entry name bytes.
-/// - If valid UTF-8, returns the UTF-8 string directly (with Hangul NFD->NFC composition).
-/// - If not valid UTF-8, automatically attempts Windows CP949 (EUC-KR) decoding.
-/// - Falls back to lossy UTF-8 if CP949 conversion fails.
+/// 1. UTF-8 first (Modern standard, with Hangul NFD->NFC composition).
+/// 2. System ANSI code page (CP_ACP: CP949 on Korean Windows, CP932 on Japanese, CP1252 on US/EU).
+/// 3. CP949 fallback (in case a non-Korean machine opens a Korean ALZip archive).
+/// 4. Lossy UTF-8 fallback.
 pub fn decode_entry_name(raw_bytes: &[u8]) -> String {
     // 1. Try UTF-8 first (Modern standard)
     if let Ok(utf8_str) = std::str::from_utf8(raw_bytes) {
         return compose_hangul_nfc(utf8_str);
     }
 
-    // 2. Fallback to Windows CP949 decoding with strict MB_ERR_INVALID_CHARS validation
     if !raw_bytes.is_empty() {
         unsafe {
-            let required_len = MultiByteToWideChar(
-                CP949,
-                MB_ERR_INVALID_CHARS,
-                raw_bytes.as_ptr(),
-                raw_bytes.len() as i32,
-                std::ptr::null_mut(),
-                0,
-            );
+            // 2. Try the current Windows system ANSI code page
+            if let Some(decoded) = try_decode_codepage(CP_ACP, raw_bytes) {
+                return compose_hangul_nfc(&decoded);
+            }
 
-            if required_len > 0 {
-                let mut wide_buf = vec![0u16; required_len as usize];
-                let converted = MultiByteToWideChar(
-                    CP949,
-                    MB_ERR_INVALID_CHARS,
-                    raw_bytes.as_ptr(),
-                    raw_bytes.len() as i32,
-                    wide_buf.as_mut_ptr(),
-                    required_len,
-                );
-
-                if converted > 0 {
-                    let decoded = String::from_utf16_lossy(&wide_buf);
-                    return compose_hangul_nfc(&decoded);
-                }
+            // 3. Try Korean CP949 (if system ANSI code page was not 949)
+            if let Some(decoded) = try_decode_codepage(CP949, raw_bytes) {
+                return compose_hangul_nfc(&decoded);
             }
         }
     }
 
-    // 3. Last resort fallback
+    // 4. Last resort fallback
     compose_hangul_nfc(&String::from_utf8_lossy(raw_bytes))
 }
 
