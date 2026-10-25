@@ -11,6 +11,20 @@ use std::os::windows::process::CommandExt;
 
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
+/// Refresh Explorer's association/icon cache after the single registration lifecycle commits.
+#[cfg(not(test))]
+pub fn notify_associations_changed() {
+    use windows_sys::Win32::UI::Shell::{SHChangeNotify, SHCNE_ASSOCCHANGED, SHCNF_IDLIST};
+    unsafe {
+        SHChangeNotify(
+            SHCNE_ASSOCCHANGED as i32,
+            SHCNF_IDLIST,
+            std::ptr::null(),
+            std::ptr::null(),
+        );
+    }
+}
+
 #[cfg(windows)]
 mod win {
     use std::path::PathBuf;
@@ -274,7 +288,7 @@ param([string]$target, [string]$desc)
 Write-Output "TARGET:$target"
 Write-Output "DESC:$desc"
 "#;
-        let test_target = "C:\\Program Files\\나방집 (Moth's & Zip)\\mothzip.exe";
+        let test_target = "C:\\Program Files\\Mothzip 도구 (Moth's & Zip)\\mothzip.exe";
         let test_desc = "Special 'quotes' & ampersand & 한글!";
 
         let out = run_powershell_script(script, &[test_target, test_desc])

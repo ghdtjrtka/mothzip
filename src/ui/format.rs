@@ -19,27 +19,27 @@ pub struct Column {
 /// Columns in display order. The widths are the 96-DPI layout, scaled to the window's DPI.
 pub const COLUMNS: [Column; 5] = [
     Column {
-        title: "이름",
+        title: "Name",
         base_width: 330,
         right_aligned: false,
     },
     Column {
-        title: "크기",
+        title: "Size",
         base_width: 110,
         right_aligned: true,
     },
     Column {
-        title: "압축 크기",
+        title: "Packed",
         base_width: 110,
         right_aligned: true,
     },
     Column {
-        title: "수정일시",
+        title: "Modified",
         base_width: 150,
         right_aligned: false,
     },
     Column {
-        title: "암호",
+        title: "Encrypted",
         base_width: 70,
         right_aligned: false,
     },
@@ -82,7 +82,7 @@ pub fn mtime_text(entry: &CatalogEntry) -> String {
 /// The password column answers one question: does opening this member need a password?
 pub fn encrypted_text(entry: &CatalogEntry) -> String {
     if entry.is_encrypted {
-        "예".to_string()
+        "yes".to_string()
     } else {
         String::new()
     }
@@ -161,6 +161,6 @@ mod tests {
         assert_eq!(encrypted_text(&entry("a", false, 1)), "");
         let mut locked = entry("a", false, 1);
         locked.is_encrypted = true;
-        assert_eq!(encrypted_text(&locked), "예");
+        assert_eq!(encrypted_text(&locked), "yes");
     }
 }

@@ -8,7 +8,15 @@ use std::process::Command;
 use super::error::ShellError;
 use super::system::{get_reg_exe, run_powershell_script};
 
+use crate::core::file_types::{file_icon_resource_id, GENERIC_ARCHIVE_ICON_ID};
 pub use crate::core::format::SUPPORTED_EXTENSIONS;
+
+fn archive_progid(extension: &str) -> String {
+    format!(
+        "MothZip.Archive.{}",
+        extension.trim_start_matches('.').replace('.', "_")
+    )
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RegValue {
@@ -196,7 +204,7 @@ impl RegistryProfile {
                 keys.push(RegKeySpec {
                     key: format!("{prefix}\\shell\\MothZip.SmartUnpack"),
                     values: vec![
-                        ("".into(), RegValue::Sz("알아서 풀기 (&MothZip)".into())),
+                        ("".into(), RegValue::Sz("Extract automatically".into())),
                         ("Icon".into(), RegValue::Sz(icon.clone())),
                         ("MultiSelectModel".into(), RegValue::Sz("Player".into())),
                     ],
@@ -217,7 +225,7 @@ impl RegistryProfile {
             keys.push(RegKeySpec {
                 key: format!("{root}\\shell\\MothZip.PackZip"),
                 values: vec![
-                    ("".into(), RegValue::Sz("ZIP으로 압축 (&MothZip)".into())),
+                    ("".into(), RegValue::Sz("Compress to ZIP".into())),
                     ("Icon".into(), RegValue::Sz(icon.clone())),
                     ("MultiSelectModel".into(), RegValue::Sz("Player".into())),
                     ("AppliesTo".into(), RegValue::Sz(applies_to.clone())),
@@ -231,7 +239,7 @@ impl RegistryProfile {
             keys.push(RegKeySpec {
                 key: format!("{root}\\shell\\MothZip.Pack"),
                 values: vec![
-                    ("".into(), RegValue::Sz("압축하기 (&MothZip)".into())),
+                    ("".into(), RegValue::Sz("Compress to… (&M)".into())),
                     ("Icon".into(), RegValue::Sz(icon.clone())),
                     ("MultiSelectModel".into(), RegValue::Sz("Player".into())),
                     ("AppliesTo".into(), RegValue::Sz(applies_to.clone())),
@@ -261,14 +269,14 @@ impl RegistryProfile {
         keys.push(RegKeySpec {
             key: "HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\MothZip".into(),
             values: vec![
-                ("DisplayName".into(), RegValue::Sz("MothZip (나방집)".into())),
+                ("DisplayName".into(), RegValue::Sz("Mothzip".into())),
                 ("DisplayIcon".into(), RegValue::Sz(icon.clone())),
                 ("DisplayVersion".into(), RegValue::Sz(version.into())),
                 ("Publisher".into(), RegValue::Sz("mothzip contributors".into())),
                 ("InstallLocation".into(), RegValue::Sz(exe_dir.clone())),
                 ("UninstallString".into(), RegValue::Sz(uninstall_cmd)),
                 ("QuietUninstallString".into(), RegValue::Sz(quiet_uninstall_cmd)),
-                ("Comments".into(), RegValue::Sz("초경량 무광고 에이전틱 압축 프로그램 (ZIP, TAR, GZ, 7Z, RAR 지원)".into())),
+                ("Comments".into(), RegValue::Sz("Small ad-free archive tool for scripts and agents (ZIP, TAR, GZ, 7Z, RAR)".into())),
                 ("NoModify".into(), RegValue::Dword(1)),
                 ("NoRepair".into(), RegValue::Dword(1)),
             ],
@@ -290,10 +298,7 @@ impl RegistryProfile {
         }
         keys.push(RegKeySpec {
             key: "HKEY_CURRENT_USER\\Software\\Classes\\Applications\\mothzip.exe".into(),
-            values: vec![(
-                "FriendlyAppName".into(),
-                RegValue::Sz("MothZip (나방집)".into()),
-            )],
+            values: vec![("FriendlyAppName".into(), RegValue::Sz("Mothzip".into()))],
         });
         keys.push(RegKeySpec {
             key: "HKEY_CURRENT_USER\\Software\\Classes\\Applications\\mothzip.exe\\DefaultIcon"
@@ -302,7 +307,7 @@ impl RegistryProfile {
         });
         keys.push(RegKeySpec {
             key: "HKEY_CURRENT_USER\\Software\\Classes\\Applications\\mothzip.exe\\shell\\open\\command".into(),
-            values: vec![("".into(), RegValue::Sz(unpack_command.clone()))],
+            values: vec![("".into(), RegValue::Sz(browse_command.clone()))],
         });
         keys.push(RegKeySpec {
             key: "HKEY_CURRENT_USER\\Software\\Classes\\Applications\\mothzip.exe\\SupportedTypes"
@@ -313,7 +318,7 @@ impl RegistryProfile {
         // 7. Capabilities & FileAssociations
         let mut file_assocs = Vec::new();
         for ext in extensions {
-            file_assocs.push((ext.to_string(), RegValue::Sz("MothZip.Archive".into())));
+            file_assocs.push((ext.to_string(), RegValue::Sz(archive_progid(ext))));
         }
         keys.push(RegKeySpec {
             key: "HKEY_CURRENT_USER\\Software\\MothZip\\Capabilities".into(),
@@ -321,7 +326,7 @@ impl RegistryProfile {
                 ("ApplicationName".into(), RegValue::Sz("MothZip".into())),
                 (
                     "ApplicationDescription".into(),
-                    RegValue::Sz("MothZip - 초경량 무광고 에이전틱 압축 프로그램".into()),
+                    RegValue::Sz("Mothzip - small ad-free archive tool".into()),
                 ),
             ],
         });
@@ -333,11 +338,14 @@ impl RegistryProfile {
         // 8. ProgId
         keys.push(RegKeySpec {
             key: "HKEY_CURRENT_USER\\Software\\Classes\\MothZip.Archive".into(),
-            values: vec![("".into(), RegValue::Sz("MothZip 압축 파일".into()))],
+            values: vec![("".into(), RegValue::Sz("Mothzip archive".into()))],
         });
         keys.push(RegKeySpec {
             key: "HKEY_CURRENT_USER\\Software\\Classes\\MothZip.Archive\\DefaultIcon".into(),
-            values: vec![("".into(), RegValue::Sz(icon.clone()))],
+            values: vec![(
+                "".into(),
+                RegValue::Sz(format!("\"{exe_str}\",-{GENERIC_ARCHIVE_ICON_ID}")),
+            )],
         });
         keys.push(RegKeySpec {
             key: "HKEY_CURRENT_USER\\Software\\Classes\\MothZip.Archive\\shell\\open\\command"
@@ -345,11 +353,49 @@ impl RegistryProfile {
             values: vec![("".into(), RegValue::Sz(browse_command.clone()))],
         });
 
-        let shared_values = vec![(
+        let mut shared_values = vec![(
             "HKEY_CURRENT_USER\\Software\\RegisteredApplications".into(),
             "MothZip".into(),
             RegValue::Sz("Software\\MothZip\\Capabilities".into()),
         )];
+
+        for extension in extensions {
+            let index = SUPPORTED_EXTENSIONS
+                .iter()
+                .position(|candidate| candidate.eq_ignore_ascii_case(extension))
+                .expect("registration accepts only supported archive extensions");
+            let progid = archive_progid(extension);
+            let root = format!("HKEY_CURRENT_USER\\Software\\Classes\\{progid}");
+            keys.extend([
+                RegKeySpec {
+                    key: root.clone(),
+                    values: vec![(
+                        String::new(),
+                        RegValue::Sz(format!(
+                            "Mothzip {} archive",
+                            extension.trim_start_matches('.').to_ascii_uppercase()
+                        )),
+                    )],
+                },
+                RegKeySpec {
+                    key: format!("{root}\\DefaultIcon"),
+                    values: vec![(
+                        String::new(),
+                        RegValue::Sz(format!("\"{exe_str}\",-{}", file_icon_resource_id(index))),
+                    )],
+                },
+                RegKeySpec {
+                    key: format!("{root}\\shell\\open\\command"),
+                    values: vec![(String::new(), RegValue::Sz(browse_command.clone()))],
+                },
+            ]);
+            // OpenWithProgids is shared with other applications: remove only our value.
+            shared_values.push((
+                format!("HKEY_CURRENT_USER\\Software\\Classes\\{extension}\\OpenWithProgids"),
+                progid,
+                RegValue::Sz(String::new()),
+            ));
+        }
 
         Self {
             keys,
@@ -944,6 +990,8 @@ where
         }
     }
     outcome.removed_legacy_verbs = retire_verbs(extensions)?;
+    #[cfg(not(test))]
+    super::system::notify_associations_changed();
     Ok(outcome)
 }
 
@@ -1045,7 +1093,7 @@ mod tests {
         let profile = RegistryProfile::build(dummy, true, SUPPORTED_EXTENSIONS);
         let content = profile.generate_reg_content();
 
-        assert!(content.contains("알아서 풀기 (&MothZip)"));
+        assert!(content.contains("Extract automatically"));
         assert!(content.contains("smart-unpack \\\"%1\\\" --open"));
         assert!(content.contains("uninstall --quiet"));
 
@@ -1053,6 +1101,44 @@ mod tests {
             assert!(content.contains(&format!("Classes\\{ext}\\shell")));
             assert!(content.contains(&format!("SystemFileAssociations\\{ext}\\shell")));
         }
+    }
+
+    #[test]
+    fn file_types_have_distinct_embedded_icons_and_shared_openwith_values() {
+        let exe = Path::new("C:\\Program Files\\MothZip\\mothzip.exe");
+        let profile = RegistryProfile::build(exe, true, SUPPORTED_EXTENSIONS);
+        let associations = profile
+            .keys
+            .iter()
+            .find(|key| key.key.ends_with("Capabilities\\FileAssociations"))
+            .unwrap();
+        let mut icons = BTreeSet::new();
+        for (index, extension) in SUPPORTED_EXTENSIONS.iter().enumerate() {
+            let progid = archive_progid(extension);
+            assert!(associations
+                .values
+                .contains(&(extension.to_string(), RegValue::Sz(progid.clone()))));
+            let key = profile
+                .keys
+                .iter()
+                .find(|key| key.key.ends_with(&format!("\\{progid}\\DefaultIcon")))
+                .unwrap();
+            let expected = format!("\"{}\",-{}", exe.display(), file_icon_resource_id(index));
+            assert_eq!(
+                key.values,
+                vec![(String::new(), RegValue::Sz(expected.clone()))]
+            );
+            assert!(icons.insert(expected));
+            assert!(profile.shared_values.iter().any(|(key, name, _)| key
+                .ends_with(&format!("{extension}\\OpenWithProgids"))
+                && name == &progid));
+        }
+        assert_eq!(icons.len(), SUPPORTED_EXTENSIONS.len());
+        let removed = profile.generate_unreg_content();
+        assert!(!removed
+            .lines()
+            .any(|line| line.starts_with("[-") && line.ends_with("\\OpenWithProgids]")));
+        assert!(!profile.generate_reg_content().contains("UserChoice"));
     }
 
     /// 1.2.0 menu contract: one extraction verb and no retired verbs; the creation side is a
@@ -1065,8 +1151,8 @@ mod tests {
 
         assert!(!content.contains("MothZip.UnpackHere"));
         assert!(!content.contains("MothZip.UnpackFolder"));
-        assert!(content.contains("ZIP으로 압축 (&MothZip)"));
-        assert!(content.contains("압축하기 (&MothZip)"));
+        assert!(content.contains("Compress to ZIP"));
+        assert!(content.contains("Compress to… (&M)"));
 
         for root in ["*", "Directory"] {
             let pack_key =
@@ -1116,7 +1202,7 @@ mod tests {
 
     #[test]
     fn test_build_stores_raw_unescaped_values() {
-        let dummy = Path::new("C:\\Program Files\\MothZip (나방집)\\mothzip.exe");
+        let dummy = Path::new("C:\\Program Files\\Mothzip 도구 (Moth's & Zip)\\mothzip.exe");
         let profile = RegistryProfile::build(dummy, true, SUPPORTED_EXTENSIONS);
 
         // UninstallString must be stored raw (single backslashes, real quotes).
@@ -1132,7 +1218,7 @@ mod tests {
             .expect("UninstallString value");
         assert!(matches!(
             cmd.1,
-            RegValue::Sz(ref s) if s == "\"C:\\Program Files\\MothZip (나방집)\\mothzip.exe\" uninstall"
+            RegValue::Sz(ref s) if s == "\"C:\\Program Files\\Mothzip 도구 (Moth's & Zip)\\mothzip.exe\" uninstall"
         ));
 
         // InstallLocation must be a bare path (no surrounding quotes).
@@ -1143,7 +1229,7 @@ mod tests {
             .expect("InstallLocation value");
         assert!(matches!(
             loc.1,
-            RegValue::Sz(ref s) if s == "C:\\Program Files\\MothZip (나방집)"
+            RegValue::Sz(ref s) if s == "C:\\Program Files\\Mothzip 도구 (Moth's & Zip)"
         ));
 
         // App Paths default and Path must be bare paths.
@@ -1160,7 +1246,7 @@ mod tests {
         );
         assert_eq!(
             path_val.1,
-            RegValue::Sz("C:\\Program Files\\MothZip (나방집)".to_string())
+            RegValue::Sz("C:\\Program Files\\Mothzip 도구 (Moth's & Zip)".to_string())
         );
     }
 
@@ -1181,7 +1267,10 @@ mod tests {
         let keys = plan["keys"].as_array().expect("keys array");
         assert!(!keys.is_empty());
         // shared value present
-        assert_eq!(plan["shared_values"].as_array().map(|a| a.len()), Some(1));
+        assert_eq!(
+            plan["shared_values"].as_array().map(|a| a.len()),
+            Some(1 + SUPPORTED_EXTENSIONS.len())
+        );
         // every declared value serialized with kind
         for spec in keys {
             for v in spec["values"].as_array().expect("values array") {
@@ -1303,10 +1392,7 @@ if (Test-Path -LiteralPath ('Registry::' + $KeyPath)) { Write-Output 'PRESENT' }
                 RegKeySpec {
                     key: uninstall.clone(),
                     values: vec![
-                        (
-                            "DisplayName".into(),
-                            RegValue::Sz("MothZip (나방집)".into()),
-                        ),
+                        ("DisplayName".into(), RegValue::Sz("Mothzip".into())),
                         ("NoModify".into(), RegValue::Dword(1)),
                     ],
                 },
@@ -1343,6 +1429,9 @@ if (Test-Path -LiteralPath ('Registry::' + $KeyPath)) { Write-Output 'PRESENT' }
                     .key
                     .replacen("HKEY_CURRENT_USER\\Software", &root.path, 1);
             }
+            for (key, _, _) in &mut profile.shared_values {
+                *key = key.replacen("HKEY_CURRENT_USER\\Software", &root.path, 1);
+            }
             let pack_key = profile
                 .keys
                 .iter()
@@ -1354,7 +1443,7 @@ if (Test-Path -LiteralPath ('Registry::' + $KeyPath)) { Write-Output 'PRESENT' }
             let seed = format!(
                 "[{pack_key}]\r\n\
                  \"SubCommands\"=\"\"\r\n\
-                 \"MUIVerb\"=\"압축하기\"\r\n\r\n\
+                 \"MUIVerb\"=\"Compress to…\"\r\n\r\n\
                  [{artifact}]\r\n\
                  @=\"mothzip.exe pack-auto\"\r\n\r\n\
                  [{foreign}]\r\n\
@@ -1402,14 +1491,14 @@ if (Test-Path -LiteralPath ('Registry::' + $KeyPath)) { Write-Output 'PRESENT' }
             let progid = format!("{}\\Classes\\MothZip.Archive", root.path);
             let seed = format!(
                 "[{uninstall}]\r\n\
-                 \"DisplayName\"=\"MothZip (나방집)\"\r\n\
+                 \"DisplayName\"=\"Mothzip 도구 (Moth's & Zip)\"\r\n\
                  \"NoModify\"=dword:00000001\r\n\
                  \"HelpLink\"=\"https://github.com/mothzip/mothzip\"\r\n\
                  \"EstimatedSize\"=dword:00000640\r\n\r\n\
                  [{uninstall}\\command]\r\n\
                  @=\"mothzip.exe uninstall\"\r\n\r\n\
                  [{progid}]\r\n\
-                 @=\"MothZip 압축 파일\"\r\n\r\n\
+                 @=\"Mothzip archive\"\r\n\r\n\
                  [{uninstall}\\LeftoverChild]\r\n\
                  \"Stale\"=\"1\"\r\n"
             );

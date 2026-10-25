@@ -273,6 +273,7 @@ for test in base['results']:
 
 workspace=base['WORKSPACE']
 sources=list((workspace/'src').rglob('*.rs'))+[workspace/n for n in ('Cargo.toml','Cargo.lock','build.rs','.cargo/config.toml','assets/moth.ico')]
+sources+=list((workspace/'assets/file-icons').glob('*.ico'))+[workspace/'tools/generate-file-icons.ps1']
 report=dict(binary=str(BINARY),binary_sha256=hashlib.sha256(BINARY.read_bytes()).hexdigest(),
     source_files_sha256={str(p.relative_to(workspace)):hashlib.sha256(p.read_bytes()).hexdigest() for p in sources},
     cases=base['results'],case_count=len(base['results']),call_count=sum(len(t['calls']) for t in base['results']),

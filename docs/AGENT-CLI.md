@@ -1,6 +1,6 @@
-# MothZip CLI contract for scripts, CI, and agents
+# Mothzip CLI contract for scripts, CI, and agents
 
-**Version 1.2.2** (Windows 10/11 x64, MIT). This page documents what a program can rely on when it drives `mothzip.exe`: the flags that exist, the JSON on each stream, how failure is signalled, and which integrity guarantees do **not** exist. It is a contract page, not a tutorial.
+**Version 1.2.3** (Windows 10/11 x64, MIT). This page documents what a program can rely on when it drives `mothzip.exe`: the flags that exist, the JSON on each stream, how failure is signalled, and which integrity guarantees do **not** exist. It is a contract page, not a tutorial.
 
 Every command line in sections 1–8 was executed against the shipped build on Windows before it was written; output blocks are real captures, not illustrations. Measured limits are marked **measured**; figures quoted from this repository's perf runs are marked as such, and the CLI additions at the end were run against the same build.
 
@@ -171,7 +171,7 @@ Two deliberate exceptions, both measured: `peek` lists structure without decompr
 
 ## 6. Integrity guarantees
 
-What actually rejects a corrupted payload depends on the container and on which command you run. Measured on archives MothZip itself created, by flipping one byte inside the payload region at ~55% of the file:
+What actually rejects a corrupted payload depends on the container and on which command you run. Measured on archives Mothzip itself created, by flipping one byte inside the payload region at ~55% of the file:
 
 | Container | Checksum in the format | `test` detected | `unpack` detected |
 | --- | --- | --- | --- |
@@ -180,16 +180,16 @@ What actually rejects a corrupted payload depends on the container and on which 
 | TAR | none (header checksum only) | no | no — extraction succeeds |
 | `.gz` / `TAR.GZ` | gzip CRC32 + ISIZE | yes | yes |
 | `.xz` / `TAR.XZ` | CRC64 per block | yes | yes |
-| `.zst` / `TAR.ZST` | content checksum written by MothZip | yes | yes |
-| `.lz4` / `TAR.LZ4` | content checksum written by MothZip | yes | yes |
+| `.zst` / `TAR.ZST` | content checksum written by Mothzip | yes | yes |
+| `.lz4` / `TAR.LZ4` | content checksum written by Mothzip | yes | yes |
 | `.br` / `TAR.BR` | **none** | no | no — extraction succeeds |
 
 Two consequences worth designing around:
 
 - **`test` now consumes the TAR stream through its trailer, so it enforces the codec checksum for TAR+codec archives.** A corrupted `TAR.GZ`/`TAR.ZST`/`TAR.XZ`/`TAR.LZ4` fails `test` with exit 1 (`passed: false` on stdout plus the stderr error), reporting `corrupt gzip stream does not have a matching checksum`, `Restored data doesn't match checksum`, `invalid block checksum`, or `ContentChecksumError`. Earlier builds reported `passed: true` and only `unpack` failed, so a wrapper that used both may now see the failure one step earlier.
-- **Brotli provides no corruption detection.** A corrupted `.br` or `TAR.BR` payload passes both `test` and `unpack`. gzip and xz carry their own checksums; zstd and LZ4 frames written by MothZip include a content checksum, so archives this tool produced are checked by both `test` and `unpack`. Streams written by other tools without that checksum have weaker detection.
+- **Brotli provides no corruption detection.** A corrupted `.br` or `TAR.BR` payload passes both `test` and `unpack`. gzip and xz carry their own checksums; zstd and LZ4 frames written by Mothzip include a content checksum, so archives this tool produced are checked by both `test` and `unpack`. Streams written by other tools without that checksum have weaker detection.
 
-`peek` is structure only. It succeeded on a password-protected ZIP with no password supplied, which is the clearest illustration that a successful `peek` says nothing about integrity. ZIP members compressed with Zstd (method 93) are read but never written; MothZip writes deflate.
+`peek` is structure only. It succeeded on a password-protected ZIP with no password supplied, which is the clearest illustration that a successful `peek` says nothing about integrity. ZIP members compressed with Zstd (method 93) are read but never written; Mothzip writes deflate.
 
 ## 7. Supported and unsupported boundary
 
@@ -318,9 +318,9 @@ These features are in the shipped 1.2.x builds; the CLI examples below were run 
 
 | Menu entry | Command |
 | --- | --- |
-| `ZIP으로 압축 (&MothZip)` | `mothzip pack-auto --format zip "%1"` |
-| `압축하기 (&MothZip)` | a cascade of 13 formats: `ZIP (.zip)`, `7Z (.7z)`, `TAR (.tar)`, `TAR.GZ (.tar.gz)`, `TAR.ZST (.tar.zst)`, `TAR.XZ (.tar.xz)`, `TAR.LZ4 (.tar.lz4)`, `TAR.BR (.tar.br)`, `GZIP (.gz)`, `Zstandard (.zst)`, `XZ (.xz)`, `LZ4 (.lz4)`, `Brotli (.br)` |
-| `알아서 풀기 (&MothZip)` (archives only) | `mothzip smart-unpack "%1" --open` |
+| `ZIP으로 압축 (&Mothzip)` | `mothzip pack-auto --format zip "%1"` |
+| `압축하기 (&Mothzip)` | a cascade of 13 formats: `ZIP (.zip)`, `7Z (.7z)`, `TAR (.tar)`, `TAR.GZ (.tar.gz)`, `TAR.ZST (.tar.zst)`, `TAR.XZ (.tar.xz)`, `TAR.LZ4 (.tar.lz4)`, `TAR.BR (.tar.br)`, `GZIP (.gz)`, `Zstandard (.zst)`, `XZ (.xz)`, `LZ4 (.lz4)`, `Brotli (.br)` |
+| `알아서 풀기 (&Mothzip)` (archives only) | `mothzip smart-unpack "%1" --open` |
 
 Archive extensions expose only the single extraction entry. The earlier `여기에 풀기` / `각각 폴더에 풀기` verbs are removed, and both install and uninstall delete the legacy `MothZip.UnpackHere` / `MothZip.UnpackFolder` keys, so an upgraded machine keeps only the current menu.
 
@@ -344,7 +344,7 @@ cmd /c "mothzip.exe pack out.zip src --to-stdout > out.zip"
 
 **RAR `cat` streams with bounded memory.** On large members peak RSS fell from 545.7 MB to **8.9 MB** (−98.4%), and it stayed flat at 8.87–9.75 MB from 64 KiB to 512 MiB members.
 
-**ZIP Zstandard (method 93) members are readable.** ZIPs written by other tools with Zstd members are read; MothZip still writes deflate (and stored at level 0), and `add`/`edit` never emit method 93. See §6.
+**ZIP Zstandard (method 93) members are readable.** ZIPs written by other tools with Zstd members are read; Mothzip still writes deflate (and stored at level 0), and `add`/`edit` never emit method 93. See §6.
 
 **`--volume-bytes` accepts any output path.** A bare relative name no longer fails with `os error 3`; bare, `.\`-prefixed, absolute, and subfolder paths all succeed, and stale higher-numbered parts from a previous set are removed. See §7.
 

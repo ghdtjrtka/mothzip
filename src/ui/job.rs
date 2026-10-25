@@ -35,16 +35,16 @@ impl JobKind {
     /// producers report totals only when they finish.
     pub fn running_label(self) -> &'static str {
         match self {
-            JobKind::ExtractAll | JobKind::ExtractSelected => "푸는 중…",
-            JobKind::Test => "검사 중…",
+            JobKind::ExtractAll | JobKind::ExtractSelected => "Extracting…",
+            JobKind::Test => "Testing…",
         }
     }
 
     /// Status line prefix when the job fails.
     pub fn failure_label(self) -> &'static str {
         match self {
-            JobKind::ExtractAll | JobKind::ExtractSelected => "압축 풀기 실패",
-            JobKind::Test => "검사 실패",
+            JobKind::ExtractAll | JobKind::ExtractSelected => "Extraction failed",
+            JobKind::Test => "Test failed",
         }
     }
 }
@@ -143,7 +143,7 @@ fn run(request: &JobRequest) -> JobResult {
 
 fn extract(request: &JobRequest) -> JobResult {
     let Some(destination) = request.destination.as_ref() else {
-        return JobResult::Failed("풀 대상 폴더가 선택되지 않았습니다".to_string());
+        return JobResult::Failed("No destination folder was chosen".to_string());
     };
     let options = ExtractionOptions {
         smart: false,
@@ -175,7 +175,7 @@ fn test(request: &JobRequest) -> JobResult {
         Ok(summary) => JobResult::Failed(
             summary
                 .error_message
-                .unwrap_or_else(|| "무결성 검사가 통과하지 못했습니다".to_string()),
+                .unwrap_or_else(|| "The integrity check did not pass".to_string()),
         ),
         Err(error) => JobResult::Failed(error.to_string()),
     }

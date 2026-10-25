@@ -7,10 +7,7 @@ use super::codec::StreamCodec;
 
 /// Shell and CLI supported archive extensions. Kept in sync with [`NAME_SUFFIXES`] by
 /// `test_supported_extensions_match_name_suffixes`.
-pub const SUPPORTED_EXTENSIONS: &[&str] = &[
-    ".zip", ".7z", ".rar", ".tar", ".gz", ".tgz", ".tar.gz", ".zst", ".tar.zst", ".xz", ".tar.xz",
-    ".lz4", ".tar.lz4", ".br", ".tar.br",
-];
+pub use super::file_types::SUPPORTED_EXTENSIONS;
 
 /// Return the list of archive extensions supported by MothZip.
 pub fn supported_extensions() -> &'static [&'static str] {

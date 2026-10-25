@@ -1,6 +1,6 @@
-# Contributing to MothZip
+# Contributing to Mothzip
 
-MothZip is a Windows-only archive CLI built for scripts and agents: one executable, no runtime, no
+Mothzip is a Windows-only archive CLI built for scripts and agents: one executable, no runtime, no
 background service, no ads, no telemetry. Its scope is deliberately narrow — archives it can create,
 read and verify, plus a small browsing window. It has no RAR creation, no repair, and no ALZ/EGG
 support. Read [README.md](README.md) for the feature scope and
@@ -76,7 +76,7 @@ Two audit scripts need notes:
   load; compare against your own previous run, not against a number in a document.
 - `audit/menu_validation.py` and `audit/gui_window_validation.py` exercise the installed Explorer
   menu and the browsing window. They write to `HKCU` and open a real window, so run them only on a
-  machine where MothZip is installed (`mothzip install`).
+  machine where Mothzip is installed (`mothzip install`).
 
 ## Layout
 

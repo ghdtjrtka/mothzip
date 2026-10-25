@@ -1,4 +1,4 @@
-# MothZip release information
+# Mothzip release information
 
 ## Public repository description
 
@@ -7,6 +7,15 @@ Ad-free Windows archive CLI with JSON output: ZIP, 7z, TAR and gzip/zstd/xz/lz4/
 Topics are in `.github/repository-metadata.json`. Repository creation and publication are separate from preparing and testing these local artifacts.
 
 ## Release notes
+
+### 1.2.3
+
+- **One name everywhere: Mothzip.** The Korean name is gone from the installer entry, the Start
+  Menu shortcut, the window titles, the file-type description and the menu label. The registry
+  ProgIds and command names are unchanged (`MothZip.Pack`, `MothZip.SmartUnpack`,
+  `mothzip.exe`), because changing them would break the associations of every existing install.
+  A Start Menu shortcut published under the retired name is removed on install, so the menu does
+  not keep two entries.
 
 ### 1.2.2
 
@@ -53,7 +62,7 @@ Review pass before publication. Everything below was reproduced first and re-mea
 - Reproduce output byte for byte with `pack --reproducible`: members are sorted and timestamps pinned to `SOURCE_DATE_EPOCH` (0 when unset). Encrypted archives are excluded because AES uses a random IV.
 - Fix `test` for `TAR.GZ`/`TAR.ZST`/`TAR.XZ`/`TAR.LZ4`: a corrupt stream now fails with exit 1 instead of reporting `passed: true`.
 - Stream RAR members with bounded memory: peak RSS on large members fell from 545.7 MB to 8.9 MB (−98.4%), flat from 64 KiB to 512 MiB.
-- Read ZIP members that other tools compressed with Zstandard (method 93); MothZip still writes deflate, or stored at level 0.
+- Read ZIP members that other tools compressed with Zstandard (method 93); Mothzip still writes deflate, or stored at level 0.
 - Fix `--volume-bytes` with a bare relative output name, which failed with `os error 3`, and remove stale higher-numbered parts from an earlier volume set.
 - Document how 7z write memory follows the LZMA2 dictionary: on a 60 MB input the default 8 MiB dictionary (level 5) peaked at 85.1 MiB, and `--7z-dict 4` peaked at 47.1 MiB for 0.02% more output, `--7z-dict 2` at 28.1 MiB for 0.30% more, `--7z-dict 1` at 18.5 MiB for 1.2% more. The level only picks that dictionary (level 0-1 = 256 KiB/1 MiB, 2-4 = 2/4/4 MiB, 5-6 = 8 MiB, 7-9 = 16/32/64 MiB), so the same ~10.5 MiB of peak RSS per MiB applies. Prefer `--level 4` or `--7z-dict` for large 7z output.
 - Publish memory as the usable limit and no throughput target: on the 32 MiB mixed baseline the maximum zstd level peaked at 744.6 MiB against 10.8 MiB at the default, 7z level 9 at 360.2 MiB against 100.4 MiB, and solid 7z unpack at 71.1 MiB. Repeated runs moved CPU-bound cases by up to 43%, so regression bands are ±10% for ordinary cases and ±25% for CPU-bound cases.

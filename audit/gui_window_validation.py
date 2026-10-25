@@ -11,15 +11,15 @@ Measured per case
 * list: ``SendMessageW(SysListView32, LVM_GETITEMCOUNT)`` compared with the inventory computed in
   Python from the source tree the fixture was packed from;
 * menu: ``GetMenu`` / ``GetSubMenu`` / ``GetMenuStringW`` / ``GetMenuItemID`` / ``GetMenuState``
-  for 압축 풀기, 선택 풀기, 검사 and 닫기;
+  for Extract all, Extract selected, Test integrity and Close;
 * status line: the ``Static`` child control read with ``WM_GETTEXT``, including the transient
-  ``푸는 중…`` text that shows the work left the UI thread;
+  ``Extracting…`` text that shows the work left the UI thread;
 * extraction: every extracted file hashed with SHA-256 and compared with the fixture, plus the
   zero-byte file, the nested folder and the Korean file name;
 * lifetime: ``WM_CLOSE`` must end the process with exit code 0;
 * close-while-busy (``zip-busy-close``): ``MOTHZIP_UI_TEST_CLOSE_WHILE_BUSY=1`` makes the window
   request a close the moment its extraction worker starts. The refusal must appear on the status
-  line (``작업 중… 완료 후 닫을 수 있습니다 [close-refused-while-busy]``), the process must stay
+  line (``Busy: close this window when the job finishes [close-refused-while-busy]``), the process must stay
   alive, the extraction must still commit every file, and the normal close must still exit 0.
   A 32 MiB stored fixture keeps the worker running long enough to observe the refusal.
 
@@ -85,12 +85,12 @@ WINDOW_CLASS = "MothZipBrowseWindow"
 LIST_VIEW_CLASS = "SysListView32"
 STATUS_CLASS = "Static"
 
-ACTION_EXTRACT_ALL = "압축 풀기"
-ACTION_EXTRACT_SELECTED = "선택 풀기"
-ACTION_TEST = "검사"
-ACTION_CLOSE = "닫기"
+ACTION_EXTRACT_ALL = "Extract all"
+ACTION_EXTRACT_SELECTED = "Extract selected"
+ACTION_TEST = "Test integrity"
+ACTION_CLOSE = "Close"
 
-TITLE_SUFFIX = "MothZip"
+TITLE_SUFFIX = "Mothzip"
 
 # The extraction target the window must use instead of the folder picker. Test-only hook; the
 # shipped behaviour is always `rfd::FileDialog::pick_folder`.
@@ -101,7 +101,7 @@ TEST_DIR_ENV = "MOTHZIP_UI_TEST_EXTRACT_DIR"
 CLOSE_HOOK_ENV = "MOTHZIP_UI_TEST_CLOSE_WHILE_BUSY"
 
 # The refusal text and the note the window adds while that hook is active.
-BUSY_CLOSE_REFUSAL = "작업 중… 완료 후 닫을 수 있습니다"
+BUSY_CLOSE_REFUSAL = "Busy: close this window when the job finishes"
 BUSY_CLOSE_NOTE = "close-refused-while-busy"
 
 # Staging directories the extraction creates inside the destination and removes on commit.
@@ -624,11 +624,11 @@ class Harness:
             run.measurements["initial_status"] = initial_status
             run.transitions.append(initial_status)
             if case.expect_load_error:
-                run.check("status.reports_load_error", "읽지 못했" in initial_status, initial_status)
+                run.check("status.reports_load_error", "Could not read" in initial_status, initial_status)
             else:
                 run.check(
                     "status.reports_entry_count",
-                    initial_status == f"{len(expected_entries)}개 항목",
+                    initial_status == f"{len(expected_entries)} entries",
                     initial_status,
                 )
 
@@ -681,7 +681,7 @@ class Harness:
                     )
 
             if case.keyboard:
-                # Esc is the accelerator for 닫기, so the same window command is exercised.
+                # Esc is the accelerator for Close, so the same window command is exercised.
                 if not self.press(hwnd, VK_ESCAPE, SCAN_ESCAPE):
                     raise RuntimeError("PostMessageW(WM_KEYDOWN VK_ESCAPE) failed")
                 run.measurements["close_method"] = "escape-accelerator"
@@ -718,7 +718,7 @@ class Harness:
     ) -> None:
         """A catalog that failed to load must ignore every route to an action.
 
-        Enter is the accelerator for 압축 풀기, and the three menu command ids are what a click or
+        Enter is the accelerator for Extract all, and the three menu command ids are what a click or
         any other accelerator sends; all of them are posted to the real window. A started job would
         change the status line, and an extraction would create the destination, so both are
         measured instead of assumed.
@@ -726,7 +726,7 @@ class Harness:
         before = self.status_text(status)
         run.measurements["status_before_ignored_actions"] = before
         run.check(
-            "load_failure.starts_from_load_error", "읽지 못했" in before, before
+            "load_failure.starts_from_load_error", "Could not read" in before, before
         )
         if not self.press(hwnd, VK_RETURN, SCAN_RETURN):
             raise RuntimeError("PostMessageW(WM_KEYDOWN VK_RETURN) failed")
@@ -768,7 +768,7 @@ class Harness:
         """
         before = self.status_text(status)
         run.measurements["status_before_extract"] = before
-        run.check("busy_close.ready_before_action", before.endswith("개 항목"), before)
+        run.check("busy_close.ready_before_action", before.endswith("entries"), before)
         self.trigger(hwnd, labels[ACTION_EXTRACT_ALL]["id"])
         run.measurements["extract_trigger"] = "menu-command-with-close-hook"
 
@@ -786,9 +786,9 @@ class Harness:
                 marker_status = current
                 alive_at_marker = process.poll() is None
                 marker_while_running = (
-                    "압축 풀기 완료" not in current and "압축 풀기 실패" not in current
+                    "Extracted " not in current and "Extraction failed" not in current
                 )
-            if "압축 풀기 완료" in current or "압축 풀기 실패" in current:
+            if "Extracted " in current or "Extraction failed" in current:
                 break
             if process.poll() is not None:
                 break
@@ -811,7 +811,7 @@ class Harness:
         )
         run.check(
             "busy_close.completion_after_refusal",
-            "압축 풀기 완료" in last,
+            "Extracted " in last,
             last,
         )
         run.check(
@@ -861,12 +861,12 @@ class Harness:
         self.trigger(hwnd, labels[ACTION_TEST]["id"])
         after_test = self.wait_for_status(
             status,
-            contains=("검사 통과", "검사 실패"),
+            contains=("Test passed", "Test failed"),
             transitions=run.transitions,
         )
         run.measurements["status_after_test"] = after_test
         run.check("integrity_action.reaches_a_verdict", after_test != before_test, after_test)
-        run.check("integrity_action.passes", "검사 통과" in after_test, after_test)
+        run.check("integrity_action.passes", "Test passed" in after_test, after_test)
 
         if case.selected_only:
             for _ in range(2):
@@ -904,17 +904,17 @@ class Harness:
         )
         after_extract = self.wait_for_status(
             status,
-            contains=("압축 풀기 완료", "압축 풀기 실패"),
+            contains=("Extracted ", "Extraction failed"),
             transitions=run.transitions,
         )
         run.measurements["status_after_extract"] = after_extract
-        run.check("extract_action.succeeded", "압축 풀기 완료" in after_extract, after_extract)
+        run.check("extract_action.succeeded", "Extracted " in after_extract, after_extract)
 
-        busy_seen = any(label == "푸는 중…" for label in run.transitions)
+        busy_seen = any(label == "Extracting…" for label in run.transitions)
         run.measurements["busy_status_observed"] = busy_seen
         if not busy_seen:
             run.notes.append(
-                "status line never showed 푸는 중…: the job finished before the first poll, so the "
+                "status line never showed Extracting…: the job finished before the first poll, so the "
                 "worker-thread hand-off is evidenced by the completion text only"
             )
 
@@ -987,7 +987,17 @@ def new_run_dir(runs_dir: Path) -> Path:
     return run_dir
 
 
+def _force_utf8_stdout() -> None:
+    """Report in UTF-8 so a detail string can never crash the summary on a CP949 console."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
+
 def main(argv: list[str]) -> int:
+    _force_utf8_stdout()
     parser = argparse.ArgumentParser(description="Validate the MothZip archive-list window on real archives.")
     parser.add_argument("--binary", required=True, help="path to the mothzip executable under test")
     parser.add_argument(

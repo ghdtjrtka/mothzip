@@ -75,7 +75,7 @@ const LOWORD_MASK: WPARAM = 0xFFFF;
 
 /// What a refused close says: the worker owns the destination until it commits or cleans up, so
 /// the window must stay alive. The running label returns when the worker finishes.
-const CLOSE_WHILE_BUSY_MESSAGE: &str = "작업 중… 완료 후 닫을 수 있습니다";
+const CLOSE_WHILE_BUSY_MESSAGE: &str = "Busy: close this window when the job finishes";
 
 /// Test-only override: when set, an extraction writes here instead of opening the folder picker.
 /// The shipped behaviour is always the picker; see `audit/delegation/gui-window-handoff.md`.
@@ -201,7 +201,7 @@ impl App {
             Err(error) => {
                 self.entries.clear();
                 self.loaded = false;
-                self.set_status(&format!("목록을 읽지 못했습니다: {error}"));
+                self.set_status(&format!("Could not read the archive: {error}"));
             }
         }
         self.sync_actions();
@@ -216,12 +216,12 @@ impl App {
 pub fn open_archive_window(request: &BrowseRequest) -> Result<(), Box<dyn std::error::Error>> {
     let archive = request.archive.clone();
     if !archive.is_file() {
-        return Err(format!("아카이브를 찾을 수 없습니다: {}", archive.display()).into());
+        return Err(format!("Archive not found: {}", archive.display()).into());
     }
     // SAFETY: the module handle of the running executable is a process-wide constant.
     let instance = unsafe { GetModuleHandleW(std::ptr::null()) };
     if instance.is_null() {
-        return Err("실행 파일 핸들을 얻지 못해 창을 만들 수 없습니다".into());
+        return Err("Cannot create the window: no module handle".into());
     }
 
     let class_name = native::wide(WINDOW_CLASS);
@@ -241,7 +241,7 @@ pub fn open_archive_window(request: &BrowseRequest) -> Result<(), Box<dyn std::e
         // SAFETY: reading the per-thread last-error code.
         let reason = unsafe { GetLastError() };
         if reason != ERROR_CLASS_ALREADY_EXISTS {
-            return Err(format!("창 클래스를 등록하지 못했습니다 (오류 {reason})").into());
+            return Err(format!("Could not register the window class (error {reason})").into());
         }
     }
 
@@ -251,7 +251,7 @@ pub fn open_archive_window(request: &BrowseRequest) -> Result<(), Box<dyn std::e
         unsafe {
             UnregisterClassW(class_name.as_ptr(), instance);
         }
-        return Err("메뉴를 만들지 못했습니다".into());
+        return Err("Could not create the menu".into());
     }
 
     let state = Box::into_raw(Box::new(App::new(
@@ -259,7 +259,7 @@ pub fn open_archive_window(request: &BrowseRequest) -> Result<(), Box<dyn std::e
         request.password.clone(),
         request.max_bytes,
     )));
-    let title = native::wide(&format!("{} — MothZip", native::display_name_of(&archive)));
+    let title = native::wide(&format!("{} — Mothzip", native::display_name_of(&archive)));
     // SAFETY: every pointer is live for the call, and `state` outlives the window: the allocation
     // is freed after the message loop in this function.
     let window = unsafe {
@@ -299,7 +299,8 @@ pub fn open_archive_window(request: &BrowseRequest) -> Result<(), Box<dyn std::e
         // message loop on this thread.
         discard_pending_quit();
         return Err(
-            "아카이브 목록 창을 만들지 못했습니다. 창을 만들 수 있는 세션인지 확인하세요".into(),
+            "Could not create the archive window; check that this session may create windows"
+                .into(),
         );
     }
 
@@ -346,7 +347,7 @@ pub fn open_archive_window(request: &BrowseRequest) -> Result<(), Box<dyn std::e
     discard_pending_quit();
     match loop_result {
         Ok(0) => Ok(()),
-        Ok(_) => Err("작업이 실패한 채로 창을 닫았습니다".into()),
+        Ok(_) => Err("Window closed while a job was still failing".into()),
         Err(error) => Err(error),
     }
 }
@@ -367,7 +368,7 @@ fn pump_messages(window: HWND, accelerators: HACCEL) -> Result<i32, Box<dyn std:
                 unsafe {
                     DestroyWindow(window);
                 }
-                return Err("메시지 루프가 실패해 창을 닫았습니다".into());
+                return Err("Window closed after the message loop failed".into());
             }
             _ => {}
         }
@@ -604,17 +605,17 @@ fn create_menu() -> HMENU {
             return std::ptr::null_mut();
         }
         for (id, label) in [
-            (ID_EXTRACT_ALL, "압축 풀기"),
-            (ID_EXTRACT_SELECTED, "선택 풀기"),
-            (ID_TEST, "검사"),
+            (ID_EXTRACT_ALL, "Extract all"),
+            (ID_EXTRACT_SELECTED, "Extract selected"),
+            (ID_TEST, "Test integrity"),
         ] {
             let text = native::wide(label);
             AppendMenuW(popup, MF_STRING, id as usize, text.as_ptr());
         }
-        let close = native::wide("닫기");
+        let close = native::wide("Close");
         AppendMenuW(popup, MF_SEPARATOR, 0, std::ptr::null());
         AppendMenuW(popup, MF_STRING, ID_CLOSE as usize, close.as_ptr());
-        let root = native::wide("파일(&F)");
+        let root = native::wide("&File");
         AppendMenuW(menu, MF_POPUP, popup as usize, root.as_ptr());
         menu
     }
@@ -668,7 +669,7 @@ fn begin_extract(app: &mut App, selected_only: bool) {
             .map(|entry| entry.name.clone())
             .collect();
         if members.is_empty() {
-            app.set_status("풀 항목을 먼저 선택하세요");
+            app.set_status("Select an item first");
             return;
         }
         members
@@ -702,7 +703,7 @@ fn choose_destination(archive: &Path) -> Option<PathBuf> {
     }
     let start = archive.parent().unwrap_or(archive);
     rfd::FileDialog::new()
-        .set_title("압축을 풀 폴더 선택")
+        .set_title("Choose a folder to extract to")
         .set_directory(start)
         .pick_folder()
 }
@@ -797,7 +798,7 @@ fn start_job(app: &mut App, kind: JobKind, destination: Option<PathBuf>, members
             app.sync_actions();
             app.set_status(kind.running_label());
         }
-        Err(error) => app.set_status(&format!("작업 스레드를 시작하지 못했습니다: {error}")),
+        Err(error) => app.set_status(&format!("Could not start the worker: {error}")),
     }
 }
 
@@ -822,7 +823,7 @@ fn on_job_done(app: &mut App) {
         None => {
             // The worker panicked instead of reporting; the job it owned still failed.
             app.job_failed = true;
-            app.set_status("작업 스레드가 결과를 보고하지 못했습니다");
+            app.set_status("The worker did not report a result");
         }
     }
     // Recomputed, never forced on: a job that finishes after a failed load leaves the actions off.
@@ -892,11 +893,11 @@ fn describe(outcome: &JobOutcome) -> String {
             bytes,
             target,
         } => format!(
-            "압축 풀기 완료: {files}개 파일, {} → {}",
+            "Extracted {files} files, {} -> {}",
             format::format_bytes(*bytes),
             display_target(target)
         ),
-        JobResult::Tested { entries } => format!("검사 통과: {entries}개 항목"),
+        JobResult::Tested { entries } => format!("Test passed: {entries} entries"),
         JobResult::Failed(reason) => format!("{}: {reason}", outcome.kind.failure_label()),
     }
 }
@@ -913,9 +914,9 @@ fn display_target(target: &Path) -> String {
 
 fn catalog_status(total: usize, shown: usize) -> String {
     if total > shown {
-        format!("{total}개 중 {shown}개 표시")
+        format!("showing {shown} of {total}")
     } else {
-        format!("{total}개 항목")
+        format!("{total} entries")
     }
 }
 
@@ -934,9 +935,9 @@ mod tests {
 
     #[test]
     fn catalog_status_reports_the_truncated_total_once_the_cap_is_hit() {
-        assert_eq!(catalog_status(0, 0), "0개 항목");
-        assert_eq!(catalog_status(7, 7), "7개 항목");
-        assert_eq!(catalog_status(70_000, MAX_ROWS), "70000개 중 50000개 표시");
+        assert_eq!(catalog_status(0, 0), "0 entries");
+        assert_eq!(catalog_status(7, 7), "7 entries");
+        assert_eq!(catalog_status(70_000, MAX_ROWS), "showing 50000 of 70000");
     }
 
     #[test]

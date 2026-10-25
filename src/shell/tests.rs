@@ -12,14 +12,14 @@ mod desktop_review_tests {
     #[test]
     fn test_path_quoting_with_spaces_and_hangul() {
         let hangul_path = Path::new(
-            "C:\\사용자\\홍길동\\AppData\\Local\\Programs\\MothZip (나방집)\\mothzip.exe",
+            "C:\\사용자\\홍길동\\AppData\\Local\\Programs\\Mothzip 도구 (Moth's & Zip)\\mothzip.exe",
         );
         let profile = RegistryProfile::build(hangul_path, true, SUPPORTED_EXTENSIONS);
         let reg = profile.generate_reg_content();
 
-        assert!(reg.contains("C:\\\\사용자\\\\홍길동\\\\AppData\\\\Local\\\\Programs\\\\MothZip (나방집)\\\\mothzip.exe"));
-        assert!(reg.contains("\\\"C:\\\\사용자\\\\홍길동\\\\AppData\\\\Local\\\\Programs\\\\MothZip (나방집)\\\\mothzip.exe\\\" smart-unpack"));
-        assert!(reg.contains("\\\"C:\\\\사용자\\\\홍길동\\\\AppData\\\\Local\\\\Programs\\\\MothZip (나방집)\\\\mothzip.exe\\\" uninstall"));
+        assert!(reg.contains("C:\\\\사용자\\\\홍길동\\\\AppData\\\\Local\\\\Programs\\\\Mothzip 도구 (Moth's & Zip)\\\\mothzip.exe"));
+        assert!(reg.contains("\\\"C:\\\\사용자\\\\홍길동\\\\AppData\\\\Local\\\\Programs\\\\Mothzip 도구 (Moth's & Zip)\\\\mothzip.exe\\\" smart-unpack"));
+        assert!(reg.contains("\\\"C:\\\\사용자\\\\홍길동\\\\AppData\\\\Local\\\\Programs\\\\Mothzip 도구 (Moth's & Zip)\\\\mothzip.exe\\\" uninstall"));
     }
 
     #[test]
@@ -212,7 +212,7 @@ Write-Output "TARGET:$target"
 Write-Output "KOREAN:$korean"
 Write-Output "QUOTES:$quotes"
 "#;
-        let test_target = "C:\\Program Files\\나방집 (Moth's & Zip)\\mothzip.exe";
+        let test_target = "C:\\Program Files\\Mothzip 도구 (Moth's & Zip)\\mothzip.exe";
         let test_korean = "초경량 & 무광고 & 에이전틱";
         let test_quotes = "Special 'single' and \"double\" quotes";
 

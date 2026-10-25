@@ -53,6 +53,8 @@ pub fn install(options: &InstallOptions) -> Result<InstallReport, ShellError> {
             fs::copy(path, &shortcut_backup)?;
         }
     }
+    // A Start Menu entry under the retired name would sit next to the new one.
+    let _retired_shortcuts = super::shortcut::remove_retired_shortcuts();
     let version = env!("CARGO_PKG_VERSION");
     let mut extras = Vec::new();
     let mut files = vec![(source.clone(), "mothzip.exe".to_string())];

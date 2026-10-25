@@ -4,6 +4,7 @@ pub mod commit;
 pub mod edit;
 pub mod encoding;
 pub mod extract;
+pub mod file_types;
 pub mod format;
 pub mod guard;
 pub mod inspect;

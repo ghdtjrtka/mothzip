@@ -110,7 +110,7 @@ fn main() -> ExitCode {
             .collect::<Vec<_>>();
         filters.push("001");
         let selected = rfd::FileDialog::new()
-            .set_title("나방집 — 압축 파일 선택")
+            .set_title("Mothzip - select an archive")
             .add_filter("Archives", &filters)
             .add_filter("All files", &["*"])
             .pick_file();
@@ -149,7 +149,7 @@ fn main() -> ExitCode {
                 ) && !cli.non_interactive
                 {
                     rfd::MessageDialog::new()
-                        .set_title("MothZip")
+                        .set_title("Mothzip")
                         .set_description(error.to_string())
                         .set_level(rfd::MessageLevel::Error)
                         .show();

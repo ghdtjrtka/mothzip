@@ -1,4 +1,4 @@
-# MothZip (나방집)
+# Mothzip
 
 An ad-free archive CLI for Windows, with JSON output for agents and Explorer actions for people. MIT licensed. No account, background service, bundled ads, or external archiver executable.
 
@@ -23,9 +23,9 @@ ALZ/EGG archives, no preview pane. Building from source and running the release 
 | GZIP (.gz) | Yes; concatenated members included | One input file |
 | Zstandard (.zst), XZ (.xz), LZ4 (.lz4), Brotli (.br) streams | Yes | One input file |
 
-Checksums differ by codec: gzip (CRC32/ISIZE) and xz (CRC64) verify inside the format, and zstd/LZ4 frames written by MothZip carry a content checksum, so `test` and `unpack` reject corruption in archives this tool created. Brotli defines no payload checksum, so a corrupted Brotli stream is not detected. zstd/LZ4 streams from other tools that omit a checksum have limited detection.
+Checksums differ by codec: gzip (CRC32/ISIZE) and xz (CRC64) verify inside the format, and zstd/LZ4 frames written by Mothzip carry a content checksum, so `test` and `unpack` reject corruption in archives this tool created. Brotli defines no payload checksum, so a corrupted Brotli stream is not detected. zstd/LZ4 streams from other tools that omit a checksum have limited detection.
 
-A `.zst` stream is unrelated to ZIP's Zstd compression method. ZIP members that other tools wrote with Zstandard (method 93) are read; MothZip itself always writes deflate, or stored at level 0.
+A `.zst` stream is unrelated to ZIP's Zstd compression method. ZIP members that other tools wrote with Zstandard (method 93) are read; Mothzip itself always writes deflate, or stored at level 0.
 
 Keep every volume together and pass the first part, such as `backup.7z.001` or `backup.part1.rar`. Support for a format family does not imply every codec or damaged archive can be recovered.
 
@@ -42,7 +42,7 @@ Installation is per user at `%LOCALAPPDATA%\Programs\MothZip`. It adds Explorer 
 
 Double-click an associated archive to open the list window: it reads the central directory without extracting anything and offers extract-all, extract-selected, test, and close (Enter extracts, Esc closes). Right-clicking files and folders gives three groups: `ZIP으로 압축` (one-click ZIP), `압축하기` (a cascade of 13 formats), and, for archives, `알아서 풀기` (smart extract); the older `여기에 풀기` / `각각 폴더에 풀기` entries are removed on upgrade. Windows 11 may place these actions under **Show more options**. Set default associations through Windows **Open with / Default apps**; installation does not overwrite protected UserChoice settings.
 
-Remove through **Settings → Apps → Installed apps → MothZip**, or `mothzip uninstall`. Only manifest-owned files are removed; unrelated files are retained. Self-removal returns `status: "scheduled"` and `cleanup_result_path`. Agents must read that result before treating removal as completed.
+Remove through **Settings → Apps → Installed apps → Mothzip**, or `mothzip uninstall`. Only manifest-owned files are removed; unrelated files are retained. Self-removal returns `status: "scheduled"` and `cleanup_result_path`. Agents must read that result before treating removal as completed.
 
 For portable use, run the executable directly. `register` / `unregister` change Explorer registration while leaving portable files intact. Release binaries are not code-signed.
 
@@ -80,7 +80,7 @@ Use `--password-stdin` to read one UTF-8 password line without a prompt. `-p` / 
 
 ## For developers and agents
 
-[The CLI contract for scripts, CI, and agents](docs/AGENT-CLI.md) lists every flag that exists, the JSON written to each stream, and the integrity guarantees that do not exist — read it before wiring MothZip into a pipeline.
+[The CLI contract for scripts, CI, and agents](docs/AGENT-CLI.md) lists every flag that exists, the JSON written to each stream, and the integrity guarantees that do not exist — read it before wiring Mothzip into a pipeline.
 
 - `--json` prints results on stdout and error objects on stderr; `--non-interactive` removes prompts and desktop windows.
 - Exit codes: **0** success, **1** processing failure, **2** invalid command line.

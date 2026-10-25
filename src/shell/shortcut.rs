@@ -19,7 +19,7 @@ pub fn get_start_menu_programs_dir() -> Option<PathBuf> {
 
 /// Retrieve the path to MothZip Start Menu shortcut (.lnk)
 pub fn get_start_menu_shortcut_path() -> Option<PathBuf> {
-    get_start_menu_programs_dir().map(|dir| dir.join("MothZip.lnk"))
+    get_start_menu_programs_dir().map(|dir| dir.join("Mothzip.lnk"))
 }
 
 /// Verify that a shortcut exists and its TargetPath matches the expected executable
@@ -41,6 +41,9 @@ Write-Output $s.TargetPath
     Ok(normalize_path(&found_target) == normalize_path(expected_target))
 }
 
+/// The one shortcut name this release publishes.
+pub const CURRENT_SHORTCUT_NAME: &str = "Mothzip.lnk";
+
 /// Create a Windows Start Menu application shortcut (.lnk) with MothZip icon.
 /// Strictly uses PowerShell -File execution protocol without temporary VBScript files.
 /// Immediately verifies TargetPath upon creation.
@@ -49,7 +52,7 @@ pub fn create_start_menu_shortcut(
     icon_path: Option<&Path>,
 ) -> Result<PathBuf, ShellError> {
     let programs_dir = get_start_menu_programs_dir().ok_or_else(|| ShellError::Shortcut {
-        target: PathBuf::from("MothZip.lnk"),
+        target: PathBuf::from("Mothzip.lnk"),
         message: "APPDATA environment variable is missing".to_string(),
     })?;
 
@@ -57,7 +60,7 @@ pub fn create_start_menu_shortcut(
         fs::create_dir_all(&programs_dir)?;
     }
 
-    let lnk_path = programs_dir.join("MothZip.lnk");
+    let lnk_path = programs_dir.join(CURRENT_SHORTCUT_NAME);
     let working_dir = exe_path.parent().unwrap_or(exe_path);
     let icon = icon_path.unwrap_or(exe_path);
 
@@ -79,7 +82,7 @@ $s.Save()
             &exe_path.to_string_lossy(),
             &icon.to_string_lossy(),
             &working_dir.to_string_lossy(),
-            "MothZip (나방집) - 초경량 무광고 에이전틱 압축 프로그램",
+            "Mothzip - small ad-free archive tool",
         ],
     )?;
 
@@ -97,6 +100,31 @@ $s.Save()
 }
 
 /// Remove Windows Start Menu application shortcut (.lnk), verifying ownership if expected target is given
+/// Shortcut file names this product has published; only these are ever removed.
+const SHORTCUT_NAMES: [&str; 2] = ["Mothzip.lnk", "MothZip.lnk"];
+
+/// Remove every Start Menu shortcut this product published under an earlier name.
+///
+/// The Start Menu entry is user-visible, so a rename would otherwise leave two entries: the new
+/// name next to the retired one. Only the exact names above are touched, and only inside this
+/// user's own Start Menu folder.
+pub fn remove_retired_shortcuts() -> Vec<PathBuf> {
+    let Some(programs_dir) = get_start_menu_programs_dir() else {
+        return Vec::new();
+    };
+    let mut removed = Vec::new();
+    for name in SHORTCUT_NAMES {
+        if name == CURRENT_SHORTCUT_NAME {
+            continue;
+        }
+        let path = programs_dir.join(name);
+        if path.is_file() && std::fs::remove_file(&path).is_ok() {
+            removed.push(path);
+        }
+    }
+    removed
+}
+
 pub fn remove_start_menu_shortcut(expected_target: Option<&Path>) -> Result<bool, ShellError> {
     if let Some(lnk_path) = get_start_menu_shortcut_path() {
         if lnk_path.exists() {
@@ -121,6 +149,6 @@ mod tests {
         let path = get_start_menu_shortcut_path();
         assert!(path.is_some());
         let p = path.unwrap();
-        assert!(p.ends_with("MothZip.lnk"));
+        assert!(p.ends_with("Mothzip.lnk"));
     }
 }

@@ -1,17 +1,43 @@
+#[path = "src/core/file_types.rs"]
+mod file_types;
+
 fn main() {
     #[cfg(windows)]
     {
         use std::{env, fs, path::PathBuf};
         let root = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
-        let icon = root.join("assets/moth.ico");
-        println!("cargo:rerun-if-changed=assets/moth.ico");
+        let mut resources = vec![
+            (1, root.join("assets/moth.ico")),
+            (
+                file_types::GENERIC_ARCHIVE_ICON_ID,
+                root.join("assets/file-icons/archive.ico"),
+            ),
+        ];
+        resources.extend(file_types::SUPPORTED_EXTENSIONS.iter().enumerate().map(
+            |(index, extension)| {
+                (
+                    file_types::file_icon_resource_id(index),
+                    root.join(format!(
+                        "assets/file-icons/{}.ico",
+                        extension.trim_start_matches('.')
+                    )),
+                )
+            },
+        ));
+        let mut icon_resources = String::new();
+        for (id, path) in resources {
+            println!("cargo:rerun-if-changed={}", path.display());
+            icon_resources.push_str(&format!(
+                "{id} ICON \"{}\"\n",
+                path.to_string_lossy().replace('\\', "\\\\")
+            ));
+        }
         let version = env::var("CARGO_PKG_VERSION").unwrap();
         let parts: Vec<_> = version.split('.').collect();
         let numeric = format!("{},{},{},0", parts[0], parts[1], parts[2]);
-        let icon_path = icon.to_string_lossy().replace('\\', "\\\\");
         let rc = format!(
             r#"#pragma code_page(65001)
-1 ICON "{icon_path}"
+{icon_resources}
 1 VERSIONINFO
  FILEVERSION {numeric}
  PRODUCTVERSION {numeric}
