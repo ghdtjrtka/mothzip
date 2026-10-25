@@ -1,12 +1,12 @@
 # 🦋 mothzip (나방집)
 
 > **Ultra-lightweight, ad-free archiver optimized for Windows Explorer context menus and AI Coding Agents.**  
-> *100% Pure Rust • Single Static Binary (~1.3 MB) • Zero Bloat • Zero Ads • AES-256 Support*
+> *100% Pure Rust • Single Static Binary (~1.6 MB) • Zero Bloat • Zero Ads • ZIP, TAR.GZ, TGZ, TAR, GZ Support*
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Built with Rust](https://img.shields.io/badge/Rust-1.80%2B-orange.svg)](https://www.rust-lang.org)
 [![Platform: Windows](https://img.shields.io/badge/Platform-Windows%2010%20%7C%2011-0078D6.svg)](https://microsoft.com/windows)
-[![Binary Size: 1.3MB](https://img.shields.io/badge/Binary%20Size-1.37%20MB-brightgreen.svg)]()
+[![Binary Size: 1.6MB](https://img.shields.io/badge/Binary%20Size-1.63%20MB-brightgreen.svg)]()
 
 ---
 
@@ -17,20 +17,21 @@ Most modern archive managers are bloated with advertisements, purchase popups, a
 At the same time, **AI Coding Agents (Cursor, Claude Code, Cline, AutoGen, etc.)** face severe pain points when dealing with archives:
 1. **Context Window Flooding**: Running `unzip -l` or `tar -tf` on large archives dumps thousands of lines of raw text, blowing up LLM token budgets and API costs.
 2. **Wasteful Temp Folders**: Extracting an entire archive just to read a single configuration file wastes disk I/O and time.
-3. **Security Vulnerabilities**: Autonomous agents are vulnerable to Zip-Slip path traversals (`../../`), Windows DOS device bugs (`CON`, `PRN`), and deceptive Zip-Bombs.
+3. **Security Vulnerabilities**: Autonomous agents are vulnerable to Zip-Slip / Tar-Slip path traversals (`../../`), Windows DOS device bugs (`CON`, `PRN`, `CLOCK$`), and deceptive Zip/Tar-Bombs.
 
 **mothzip** solves both worlds out of the box:
-- **For Humans**: One-command registration adds **"알아서 풀기 (Smart Unpack)"**, **"여기에 풀기"**, and **"각각 폴더에 풀기"** directly to Windows Explorer right-click. Also supports right-clicking **any individual file or folder** to compress it into a `.zip`. Zero ads, zero background services.
+- **For Humans**: One-command registration adds **"알아서 풀기 (Smart Unpack)"**, **"여기에 풀기"**, and **"각각 폴더에 풀기"** directly to Windows Explorer right-click for **`.zip`, `.tar.gz`, `.tgz`, `.tar`, and `.gz`**. Also supports right-clicking **any individual file or folder** to compress it into a `.zip`. Zero ads, zero background services.
 - **For AI Agents**: Token-capped structured JSON inspection (`peek --json`), zero-extraction streaming (`cat`), AES-256 decryption, and multi-layered security guards.
 
 ---
 
 ## ⚡ Key Features & Production Hardening
 
-### 1. 스마트 알아서 풀기 (Smart Unpack)
+### 1. 전 포맷 스마트 알아서 풀기 (Smart Unpack across ZIP, TAR.GZ, TGZ, TAR)
 Eliminates desktop and folder clutter automatically:
-* **Single Root Archive**: If all files are already wrapped inside a root directory (e.g., `myapp/...`), extracts directly to target without redundant nesting.
-* **Flat / Loose Files Archive**: If multiple files or directories are loose at the root, automatically creates a dedicated subfolder (`dest/archive_name/...`) to keep your directory clean.
+* **Single Root Archive**: If all files are already wrapped inside a root directory (e.g., `redis-7.2/...`), extracts directly to target without redundant nesting.
+* **Flat / Loose Files Archive**: If multiple files or directories are loose at the root, automatically creates a dedicated subfolder (`dest/archive_stem/...`) to keep your directory clean.
+* **Multi-Format Automatic Detection**: `.zip`, `.tar.gz`, `.tgz`, `.tar` are recognized seamlessly by extension and magic bytes.
 
 ### 2. 한국어 CP949 / EUC-KR 및 macOS NFD 한글 자모 분리 완벽 해결
 * **CP949/EUC-KR 자동 감지**: 구버전 알집, 윈도우 탐색기, 공공기관 등에서 UTF-8 플래그 없이 압축된 한글 파일명을 자동 감지하여 깨짐 없이 원본 그대로 복원합니다.
@@ -38,10 +39,11 @@ Eliminates desktop and folder clutter automatically:
 
 ### 3. Windows 앱 및 탐색기 우클릭 등록 (Start Menu & Settings)
 * `mothzip register` 한 번으로:
-  * **탐색기 우클릭 메뉴**: .zip에 `알아서 풀기 (&MothZip)`, `여기에 풀기`, `각각 폴더에 풀기`, 일반 파일/폴더에 `ZIP으로 압축 (&MothZip)` 등록
+  * **탐색기 우클릭 메뉴**: `.zip`, `.tar.gz`, `.tgz`, `.tar`, `.gz`에 `알아서 풀기 (&MothZip)`, `여기에 풀기`, `각각 폴더에 풀기`, 일반 파일/폴더에 `ZIP으로 압축 (&MothZip)` 등록
   * **시작 메뉴 바로가기**: 나방 아이콘이 적용된 `MothZip (나방집)` 바로가기 자동 생성
   * **설정 > 앱 > 설치된 앱**: 나방 아이콘과 함께 제어판/설정에 정식 앱으로 등록 (`mothzip unregister` 간편 삭제 지원)
   * **실행 창 (`Win + R`)**: `mothzip` 명령어로 즉시 호출 가능
+  * **마우스 드래그 앤 드롭 지원**: 탐색기에서 아카이브를 `mothzip.exe` 아이콘으로 끌어다 놓기만 해도 자동 압축 해제
 
 ### 4. 암호화 아카이브 (AES-256 / ZipCrypto) 및 대화형 프롬프트
 * `-p, --password <PASS>` 옵션을 통해 WinZip AES-128, AES-256 및 전통적인 ZipCrypto 암호화 아카이브를 완벽하게 해제하고 검사할 수 있습니다.

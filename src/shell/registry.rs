@@ -3,6 +3,27 @@ use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 
+fn format_unpack_verbs(ext_key: &str, exe_str: &str) -> String {
+    format!(
+        "[{ext_key}\\shell\\MothZip.SmartUnpack]\r\n\
+@=\"알아서 풀기 (&MothZip)\"\r\n\
+\"Icon\"=\"\\\"{exe_str}\\\",0\"\r\n\
+\"MultiSelectModel\"=\"Player\"\r\n\r\n\
+[{ext_key}\\shell\\MothZip.SmartUnpack\\command]\r\n\
+@=\"\\\"{exe_str}\\\" smart-unpack \\\"%1\\\"\"\r\n\r\n\
+[{ext_key}\\shell\\MothZip.UnpackHere]\r\n\
+@=\"여기에 풀기\"\r\n\
+\"MultiSelectModel\"=\"Player\"\r\n\r\n\
+[{ext_key}\\shell\\MothZip.UnpackHere\\command]\r\n\
+@=\"\\\"{exe_str}\\\" unpack \\\"%1\\\"\"\r\n\r\n\
+[{ext_key}\\shell\\MothZip.UnpackFolder]\r\n\
+@=\"각각 폴더에 풀기\"\r\n\
+\"MultiSelectModel\"=\"Player\"\r\n\r\n\
+[{ext_key}\\shell\\MothZip.UnpackFolder\\command]\r\n\
+@=\"\\\"{exe_str}\\\" unpack \\\"%1\\\" --to-folder\"\r\n\r\n"
+    )
+}
+
 /// Generate .reg script for context menu and application registration
 pub fn generate_reg_content(exe_path: &Path) -> String {
     let exe_str = exe_path.to_string_lossy().replace('\\', "\\\\");
@@ -12,59 +33,47 @@ pub fn generate_reg_content(exe_path: &Path) -> String {
         .to_string_lossy()
         .replace('\\', "\\\\");
 
-    format!(
-        "Windows Registry Editor Version 5.00\r\n\r\n\
-; 1. Right-click on .zip archives (Direct Extension)\r\n\
-[HKEY_CURRENT_USER\\Software\\Classes\\.zip\\shell\\MothZip.SmartUnpack]\r\n\
-@=\"알아서 풀기 (&MothZip)\"\r\n\
-\"Icon\"=\"\\\"{exe_str}\\\",0\"\r\n\
-\"MultiSelectModel\"=\"Player\"\r\n\r\n\
-[HKEY_CURRENT_USER\\Software\\Classes\\.zip\\shell\\MothZip.SmartUnpack\\command]\r\n\
-@=\"\\\"{exe_str}\\\" smart-unpack \\\"%1\\\"\"\r\n\r\n\
-[HKEY_CURRENT_USER\\Software\\Classes\\.zip\\shell\\MothZip.UnpackHere]\r\n\
-@=\"여기에 풀기\"\r\n\
-\"MultiSelectModel\"=\"Player\"\r\n\r\n\
-[HKEY_CURRENT_USER\\Software\\Classes\\.zip\\shell\\MothZip.UnpackHere\\command]\r\n\
-@=\"\\\"{exe_str}\\\" unpack \\\"%1\\\"\"\r\n\r\n\
-[HKEY_CURRENT_USER\\Software\\Classes\\.zip\\shell\\MothZip.UnpackFolder]\r\n\
-@=\"각각 폴더에 풀기\"\r\n\
-\"MultiSelectModel\"=\"Player\"\r\n\r\n\
-[HKEY_CURRENT_USER\\Software\\Classes\\.zip\\shell\\MothZip.UnpackFolder\\command]\r\n\
-@=\"\\\"{exe_str}\\\" unpack \\\"%1\\\" --to-folder\"\r\n\r\n\
-; 2. Right-click on .zip archives (SystemFileAssociations for Windows 10/11 Explorer)\r\n\
-[HKEY_CURRENT_USER\\Software\\Classes\\SystemFileAssociations\\.zip\\shell\\MothZip.SmartUnpack]\r\n\
-@=\"알아서 풀기 (&MothZip)\"\r\n\
-\"Icon\"=\"\\\"{exe_str}\\\",0\"\r\n\
-\"MultiSelectModel\"=\"Player\"\r\n\r\n\
-[HKEY_CURRENT_USER\\Software\\Classes\\SystemFileAssociations\\.zip\\shell\\MothZip.SmartUnpack\\command]\r\n\
-@=\"\\\"{exe_str}\\\" smart-unpack \\\"%1\\\"\"\r\n\r\n\
-[HKEY_CURRENT_USER\\Software\\Classes\\SystemFileAssociations\\.zip\\shell\\MothZip.UnpackHere]\r\n\
-@=\"여기에 풀기\"\r\n\
-\"MultiSelectModel\"=\"Player\"\r\n\r\n\
-[HKEY_CURRENT_USER\\Software\\Classes\\SystemFileAssociations\\.zip\\shell\\MothZip.UnpackHere\\command]\r\n\
-@=\"\\\"{exe_str}\\\" unpack \\\"%1\\\"\"\r\n\r\n\
-[HKEY_CURRENT_USER\\Software\\Classes\\SystemFileAssociations\\.zip\\shell\\MothZip.UnpackFolder]\r\n\
-@=\"각각 폴더에 풀기\"\r\n\
-\"MultiSelectModel\"=\"Player\"\r\n\r\n\
-[HKEY_CURRENT_USER\\Software\\Classes\\SystemFileAssociations\\.zip\\shell\\MothZip.UnpackFolder\\command]\r\n\
-@=\"\\\"{exe_str}\\\" unpack \\\"%1\\\" --to-folder\"\r\n\r\n\
-; 3. Right-click on any single file (pack to <name>.zip, hides on .zip to avoid menu clutter)\r\n\
-[HKEY_CURRENT_USER\\Software\\Classes\\*\\shell\\MothZip.Pack]\r\n\
+    let mut reg = String::from("Windows Registry Editor Version 5.00\r\n\r\n");
+
+    // 1. Right-click on supported archives (.zip, .tar, .tgz, .gz)
+    let supported_exts = [".zip", ".tar", ".tgz", ".gz"];
+    for ext in supported_exts {
+        // Direct extension verb
+        reg.push_str(&format_unpack_verbs(
+            &format!("HKEY_CURRENT_USER\\Software\\Classes\\{ext}"),
+            &exe_str,
+        ));
+        // Windows 10/11 Explorer SystemFileAssociations
+        reg.push_str(&format_unpack_verbs(
+            &format!("HKEY_CURRENT_USER\\Software\\Classes\\SystemFileAssociations\\{ext}"),
+            &exe_str,
+        ));
+    }
+
+    // 2. Right-click on any single non-archive file (pack to <name>.zip)
+    reg.push_str(&format!(
+        "[HKEY_CURRENT_USER\\Software\\Classes\\*\\shell\\MothZip.Pack]\r\n\
 @=\"ZIP으로 압축 (&MothZip)\"\r\n\
 \"Icon\"=\"\\\"{exe_str}\\\",0\"\r\n\
-\"AppliesTo\"=\"System.FileExtension:<>\\\".zip\\\"\"\r\n\
+\"AppliesTo\"=\"System.FileExtension:<>\\\".zip\\\" AND System.FileExtension:<>\\\".tar\\\" AND System.FileExtension:<>\\\".tgz\\\" AND System.FileExtension:<>\\\".gz\\\"\"\r\n\
 \"MultiSelectModel\"=\"Player\"\r\n\r\n\
 [HKEY_CURRENT_USER\\Software\\Classes\\*\\shell\\MothZip.Pack\\command]\r\n\
-@=\"\\\"{exe_str}\\\" pack-auto \\\"%1\\\"\"\r\n\r\n\
-; 4. Right-click on folders (pack to <folder>.zip)\r\n\
-[HKEY_CURRENT_USER\\Software\\Classes\\Directory\\shell\\MothZip.Pack]\r\n\
+@=\"\\\"{exe_str}\\\" pack-auto \\\"%1\\\"\"\r\n\r\n"
+    ));
+
+    // 3. Right-click on folders (pack to <folder>.zip)
+    reg.push_str(&format!(
+        "[HKEY_CURRENT_USER\\Software\\Classes\\Directory\\shell\\MothZip.Pack]\r\n\
 @=\"ZIP으로 압축 (&MothZip)\"\r\n\
 \"Icon\"=\"\\\"{exe_str}\\\",0\"\r\n\
 \"MultiSelectModel\"=\"Player\"\r\n\r\n\
 [HKEY_CURRENT_USER\\Software\\Classes\\Directory\\shell\\MothZip.Pack\\command]\r\n\
-@=\"\\\"{exe_str}\\\" pack-auto \\\"%1\\\"\"\r\n\r\n\
-; 5. Windows Installed Application Registry (shows in Settings / Control Panel with icon)\r\n\
-[HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\MothZip]\r\n\
+@=\"\\\"{exe_str}\\\" pack-auto \\\"%1\\\"\"\r\n\r\n"
+    ));
+
+    // 4. Windows Installed Application Registry (shows in Settings / Control Panel with icon)
+    reg.push_str(&format!(
+        "[HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\MothZip]\r\n\
 \"DisplayName\"=\"MothZip (나방집)\"\r\n\
 \"DisplayIcon\"=\"\\\"{exe_str}\\\",0\"\r\n\
 \"DisplayVersion\"=\"0.1.0\"\r\n\
@@ -73,24 +82,36 @@ pub fn generate_reg_content(exe_path: &Path) -> String {
 \"UninstallString\"=\"\\\"{exe_str}\\\" unregister\"\r\n\
 \"QuietUninstallString\"=\"\\\"{exe_str}\\\" unregister\"\r\n\
 \"HelpLink\"=\"https://github.com/mothzip/mothzip\"\r\n\
-\"Comments\"=\"초경량 무광고 에이전틱 압축 프로그램\"\r\n\
+\"Comments\"=\"초경량 무광고 에이전틱 압축 프로그램 (ZIP, TAR, GZ 완벽 지원)\"\r\n\
 \"EstimatedSize\"=dword:00000640\r\n\
 \"NoModify\"=dword:00000001\r\n\
-\"NoRepair\"=dword:00000001\r\n\r\n\
-; 6. App Paths (Run dialog / Win+R -> mothzip)\r\n\
-[HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\App Paths\\mothzip.exe]\r\n\
+\"NoRepair\"=dword:00000001\r\n\r\n"
+    ));
+
+    // 5. App Paths (Run dialog / Win+R -> mothzip)
+    reg.push_str(&format!(
+        "[HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\App Paths\\mothzip.exe]\r\n\
 @=\"\\\"{exe_str}\\\"\"\r\n\
-\"Path\"=\"\\\"{exe_dir}\\\"\"\r\n\r\n\
-; 7. Application Registration\r\n\
-[HKEY_CURRENT_USER\\Software\\Classes\\Applications\\mothzip.exe]\r\n\
+\"Path\"=\"\\\"{exe_dir}\\\"\"\r\n\r\n"
+    ));
+
+    // 6. Application Registration
+    reg.push_str(&format!(
+        "[HKEY_CURRENT_USER\\Software\\Classes\\Applications\\mothzip.exe]\r\n\
 \"FriendlyAppName\"=\"MothZip (나방집)\"\r\n\r\n\
 [HKEY_CURRENT_USER\\Software\\Classes\\Applications\\mothzip.exe\\DefaultIcon]\r\n\
 @=\"\\\"{exe_str}\\\",0\"\r\n\r\n\
 [HKEY_CURRENT_USER\\Software\\Classes\\Applications\\mothzip.exe\\shell\\open\\command]\r\n\
 @=\"\\\"{exe_str}\\\" smart-unpack \\\"%1\\\"\"\r\n\r\n\
 [HKEY_CURRENT_USER\\Software\\Classes\\Applications\\mothzip.exe\\SupportedTypes]\r\n\
-\".zip\"=\"\"\r\n"
-    )
+\".zip\"=\"\"\r\n\
+\".tar\"=\"\"\r\n\
+\".tgz\"=\"\"\r\n\
+\".gz\"=\"\"\r\n\
+\".tar.gz\"=\"\"\r\n"
+    ));
+
+    reg
 }
 
 /// Generate .reg script for context menu and application removal
@@ -99,9 +120,27 @@ pub fn generate_unreg_content() -> &'static str {
 [-HKEY_CURRENT_USER\\Software\\Classes\\.zip\\shell\\MothZip.SmartUnpack]\r\n\
 [-HKEY_CURRENT_USER\\Software\\Classes\\.zip\\shell\\MothZip.UnpackHere]\r\n\
 [-HKEY_CURRENT_USER\\Software\\Classes\\.zip\\shell\\MothZip.UnpackFolder]\r\n\
+[-HKEY_CURRENT_USER\\Software\\Classes\\.tar\\shell\\MothZip.SmartUnpack]\r\n\
+[-HKEY_CURRENT_USER\\Software\\Classes\\.tar\\shell\\MothZip.UnpackHere]\r\n\
+[-HKEY_CURRENT_USER\\Software\\Classes\\.tar\\shell\\MothZip.UnpackFolder]\r\n\
+[-HKEY_CURRENT_USER\\Software\\Classes\\.tgz\\shell\\MothZip.SmartUnpack]\r\n\
+[-HKEY_CURRENT_USER\\Software\\Classes\\.tgz\\shell\\MothZip.UnpackHere]\r\n\
+[-HKEY_CURRENT_USER\\Software\\Classes\\.tgz\\shell\\MothZip.UnpackFolder]\r\n\
+[-HKEY_CURRENT_USER\\Software\\Classes\\.gz\\shell\\MothZip.SmartUnpack]\r\n\
+[-HKEY_CURRENT_USER\\Software\\Classes\\.gz\\shell\\MothZip.UnpackHere]\r\n\
+[-HKEY_CURRENT_USER\\Software\\Classes\\.gz\\shell\\MothZip.UnpackFolder]\r\n\
 [-HKEY_CURRENT_USER\\Software\\Classes\\SystemFileAssociations\\.zip\\shell\\MothZip.SmartUnpack]\r\n\
 [-HKEY_CURRENT_USER\\Software\\Classes\\SystemFileAssociations\\.zip\\shell\\MothZip.UnpackHere]\r\n\
 [-HKEY_CURRENT_USER\\Software\\Classes\\SystemFileAssociations\\.zip\\shell\\MothZip.UnpackFolder]\r\n\
+[-HKEY_CURRENT_USER\\Software\\Classes\\SystemFileAssociations\\.tar\\shell\\MothZip.SmartUnpack]\r\n\
+[-HKEY_CURRENT_USER\\Software\\Classes\\SystemFileAssociations\\.tar\\shell\\MothZip.UnpackHere]\r\n\
+[-HKEY_CURRENT_USER\\Software\\Classes\\SystemFileAssociations\\.tar\\shell\\MothZip.UnpackFolder]\r\n\
+[-HKEY_CURRENT_USER\\Software\\Classes\\SystemFileAssociations\\.tgz\\shell\\MothZip.SmartUnpack]\r\n\
+[-HKEY_CURRENT_USER\\Software\\Classes\\SystemFileAssociations\\.tgz\\shell\\MothZip.UnpackHere]\r\n\
+[-HKEY_CURRENT_USER\\Software\\Classes\\SystemFileAssociations\\.tgz\\shell\\MothZip.UnpackFolder]\r\n\
+[-HKEY_CURRENT_USER\\Software\\Classes\\SystemFileAssociations\\.gz\\shell\\MothZip.SmartUnpack]\r\n\
+[-HKEY_CURRENT_USER\\Software\\Classes\\SystemFileAssociations\\.gz\\shell\\MothZip.UnpackHere]\r\n\
+[-HKEY_CURRENT_USER\\Software\\Classes\\SystemFileAssociations\\.gz\\shell\\MothZip.UnpackFolder]\r\n\
 [-HKEY_CURRENT_USER\\Software\\Classes\\*\\shell\\MothZip.Pack]\r\n\
 [-HKEY_CURRENT_USER\\Software\\Classes\\Directory\\shell\\MothZip.Pack]\r\n\
 [-HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\MothZip]\r\n\
@@ -277,5 +316,8 @@ mod tests {
         assert!(content.contains("App Paths\\mothzip.exe"));
         assert!(content.contains("MultiSelectModel"));
         assert!(content.contains("AppliesTo"));
+        assert!(content.contains("SystemFileAssociations\\.tar\\shell"));
+        assert!(content.contains("SystemFileAssociations\\.tgz\\shell"));
+        assert!(content.contains("SystemFileAssociations\\.gz\\shell"));
     }
 }

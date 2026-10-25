@@ -45,13 +45,8 @@ fn normalize_args(raw_args: Vec<String>) -> Vec<String> {
     if let Some(idx) = subcmd_idx {
         let first_arg = &raw_args[idx];
         if !SUBCOMMANDS.contains(&first_arg.as_str()) {
-            let is_zip = first_arg.ends_with(".zip")
-                || first_arg.ends_with(".ZIP")
-                || Path::new(first_arg)
-                    .extension()
-                    .is_some_and(|ext| ext.eq_ignore_ascii_case("zip"));
-
-            let default_cmd = if is_zip { "smart-unpack" } else { "pack-auto" };
+            let is_arch = crate::core::format::is_supported_archive(first_arg);
+            let default_cmd = if is_arch { "smart-unpack" } else { "pack-auto" };
             let mut new_args = raw_args;
             new_args.insert(idx, default_cmd.to_string());
             return new_args;

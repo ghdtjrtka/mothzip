@@ -5,8 +5,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use zip::result::ZipError;
 use zip::ZipArchive;
 
+use super::format::{archive_stem_cleaned, detect_archive_format, ArchiveFormat};
 use super::guard::{check_zip_bomb, sanitize_entry_path, DEFAULT_MAX_UNCOMPRESSED_BYTES};
-use super::smart::plan_smart_unpack;
+use super::smart::{plan_smart_unpack, plan_smart_unpack_tar};
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ExtractionSummary {
@@ -40,9 +41,31 @@ pub fn zip_datetime_to_system_time(dt: zip::DateTime) -> Option<SystemTime> {
     }
 }
 
-/// Safely extract an archive with Zip-Slip protection, smart unpack, timestamp preservation,
-/// and password support.
+/// Safely extract an archive (.zip, .tar.gz, .tgz, .tar) with Zip/Tar-Slip protection,
+/// smart unpack, timestamp preservation, and password support.
 pub fn extract_archive(
+    archive_path: &Path,
+    output_base: &Path,
+    smart: bool,
+    force_subfolder: bool,
+    password: Option<&str>,
+) -> Result<ExtractionSummary, Box<dyn std::error::Error>> {
+    let format = detect_archive_format(archive_path)?;
+    match format {
+        ArchiveFormat::Zip => {
+            extract_zip_archive(archive_path, output_base, smart, force_subfolder, password)
+        }
+        ArchiveFormat::TarGz => {
+            extract_tar_archive(archive_path, output_base, true, smart, force_subfolder)
+        }
+        ArchiveFormat::Tar => {
+            extract_tar_archive(archive_path, output_base, false, smart, force_subfolder)
+        }
+    }
+}
+
+/// Extract a standard .zip archive
+fn extract_zip_archive(
     archive_path: &Path,
     output_base: &Path,
     smart: bool,
@@ -51,19 +74,16 @@ pub fn extract_archive(
 ) -> Result<ExtractionSummary, Box<dyn std::error::Error>> {
     let file = File::open(archive_path)?;
     let mut archive = ZipArchive::new(file)?;
-    let archive_stem = archive_path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("extracted");
+    let archive_stem = archive_stem_cleaned(archive_path);
 
     let (target_dir, smart_adjusted) = if force_subfolder {
         let total_uncompressed: u64 = (0..archive.len())
             .filter_map(|i| archive.by_index(i).ok().map(|e| e.size()))
             .sum();
         check_zip_bomb(total_uncompressed, DEFAULT_MAX_UNCOMPRESSED_BYTES)?;
-        (output_base.join(archive_stem), true)
+        (output_base.join(&archive_stem), true)
     } else if smart {
-        let plan = plan_smart_unpack(&mut archive, archive_stem, output_base)?;
+        let plan = plan_smart_unpack(&mut archive, &archive_stem, output_base)?;
         check_zip_bomb(plan.total_uncompressed_bytes, DEFAULT_MAX_UNCOMPRESSED_BYTES)?;
         (plan.target_dir, !plan.has_single_root)
     } else {
@@ -91,7 +111,9 @@ pub fn extract_archive(
             },
             None => match archive.by_index(i) {
                 Ok(e) => e,
-                Err(ZipError::UnsupportedArchive(msg)) if msg.contains("Password") || msg.contains("encrypted") => {
+                Err(ZipError::UnsupportedArchive(msg))
+                    if msg.contains("Password") || msg.contains("encrypted") =>
+                {
                     return Err(
                         "Archive entry is password-protected. Please supply --password <PASS>"
                             .into(),
@@ -228,6 +250,182 @@ pub fn extract_archive(
     })
 }
 
+/// Extract a .tar or .tar.gz / .tgz archive with adversarial security guards
+fn extract_tar_archive(
+    archive_path: &Path,
+    output_base: &Path,
+    is_gz: bool,
+    smart: bool,
+    force_subfolder: bool,
+) -> Result<ExtractionSummary, Box<dyn std::error::Error>> {
+    let archive_stem = archive_stem_cleaned(archive_path);
+    let archive_file_size = fs::metadata(archive_path)?.len();
+
+    let (target_dir, smart_adjusted) = if force_subfolder {
+        (output_base.join(&archive_stem), true)
+    } else if smart {
+        let plan = if is_gz {
+            let f = File::open(archive_path)?;
+            let gz = flate2::read::GzDecoder::new(f);
+            let tar = tar::Archive::new(gz);
+            plan_smart_unpack_tar(tar, &archive_stem, output_base, archive_file_size)?
+        } else {
+            let f = File::open(archive_path)?;
+            let tar = tar::Archive::new(f);
+            plan_smart_unpack_tar(tar, &archive_stem, output_base, archive_file_size)?
+        };
+        check_zip_bomb(plan.total_uncompressed_bytes, DEFAULT_MAX_UNCOMPRESSED_BYTES)?;
+        (plan.target_dir, !plan.has_single_root)
+    } else {
+        (output_base.to_path_buf(), false)
+    };
+
+    fs::create_dir_all(&target_dir)?;
+    let resolved_target = target_dir.canonicalize().unwrap_or_else(|_| target_dir.clone());
+
+    let file = File::open(archive_path)?;
+    let mut extracted_files = 0;
+    let mut extracted_bytes = 0u64;
+
+    let reader: Box<dyn Read> = if is_gz {
+        Box::new(flate2::read::GzDecoder::new(file))
+    } else {
+        Box::new(file)
+    };
+    let mut tar = tar::Archive::new(reader);
+
+    for entry_res in tar.entries()? {
+        let mut entry = entry_res?;
+        let path_cow = entry.path()?;
+        let raw_path = path_cow.to_string_lossy().to_string();
+        let raw_name = crate::core::encoding::compose_hangul_nfc(&raw_path);
+
+        // Skip macOS/Windows system junk files (__MACOSX, .DS_Store, Thumbs.db, pax_global_header)
+        let normalized = raw_name.replace('\\', "/");
+        if normalized.starts_with("__MACOSX/")
+            || normalized == "__MACOSX"
+            || normalized.ends_with("/.DS_Store")
+            || normalized == ".DS_Store"
+            || normalized.ends_with("/Thumbs.db")
+            || normalized == "Thumbs.db"
+            || normalized.starts_with("._")
+            || normalized.contains("/._")
+            || normalized == "pax_global_header"
+        {
+            continue;
+        }
+
+        let dest_path = sanitize_entry_path(&resolved_target, &raw_name)?;
+
+        // Defense against Symlink / Junction redirection
+        if let Some(parent) = dest_path.parent() {
+            if parent.exists() && parent != resolved_target {
+                if let Ok(meta) = fs::symlink_metadata(parent) {
+                    if meta.file_type().is_symlink() {
+                        return Err(format!(
+                            "Security violation: parent path '{}' is a symlink",
+                            parent.display()
+                        )
+                        .into());
+                    }
+                }
+            }
+        }
+
+        let entry_type = entry.header().entry_type();
+        let is_dir_entry = entry_type.is_dir() || raw_name.ends_with('/') || raw_name.ends_with('\\');
+
+        if is_dir_entry {
+            if dest_path.is_file() {
+                return Err(format!(
+                    "Cannot extract directory '{}': an existing file with the same name already exists",
+                    dest_path.display()
+                )
+                .into());
+            }
+            fs::create_dir_all(&dest_path)?;
+        } else if entry_type.is_file() {
+            if dest_path.is_dir() {
+                return Err(format!(
+                    "Cannot extract file '{}': an existing directory with the same name already exists",
+                    dest_path.display()
+                )
+                .into());
+            }
+
+            if let Some(parent) = dest_path.parent() {
+                if !parent.exists() {
+                    fs::create_dir_all(parent)?;
+                }
+            }
+
+            if dest_path.exists() {
+                if let Ok(meta) = fs::metadata(&dest_path) {
+                    let mut perms = meta.permissions();
+                    if perms.readonly() {
+                        #[allow(clippy::permissions_set_readonly_false)]
+                        perms.set_readonly(false);
+                        let _ = fs::set_permissions(&dest_path, perms);
+                    }
+                }
+            }
+
+            let mut outfile = File::create(&dest_path).map_err(|e| {
+                format!(
+                    "Failed to create destination file '{}': {}",
+                    dest_path.display(),
+                    e
+                )
+            })?;
+
+            let entry_size = entry.header().size()?;
+            let max_entry_bytes = entry_size + 4096;
+            let mut limited = (&mut entry).take(max_entry_bytes + 1);
+            let written = match io::copy(&mut limited, &mut outfile) {
+                Ok(w) => w,
+                Err(e) => {
+                    drop(outfile);
+                    let _ = fs::remove_file(&dest_path);
+                    return Err(format!("Extraction error on '{}': {}", raw_name, e).into());
+                }
+            };
+
+            if written > max_entry_bytes {
+                let _ = fs::remove_file(&dest_path);
+                return Err(format!(
+                    "Security violation: entry '{}' exceeded declared size (deceptive tar-bomb detected)",
+                    raw_name
+                )
+                .into());
+            }
+
+            extracted_bytes += written;
+            if extracted_bytes > DEFAULT_MAX_UNCOMPRESSED_BYTES {
+                let _ = fs::remove_file(&dest_path);
+                return Err(format!(
+                    "Security violation: total extracted data exceeded global safety threshold ({} GB)",
+                    DEFAULT_MAX_UNCOMPRESSED_BYTES / (1024 * 1024 * 1024)
+                )
+                .into());
+            }
+
+            if let Ok(mtime) = entry.header().mtime() {
+                let mod_time = UNIX_EPOCH + Duration::from_secs(mtime);
+                let _ = outfile.set_times(fs::FileTimes::new().set_modified(mod_time));
+            }
+
+            extracted_files += 1;
+        }
+    }
+
+    Ok(ExtractionSummary {
+        extracted_files,
+        extracted_bytes,
+        target_dir,
+        smart_adjusted,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -282,5 +480,81 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_tar_gz_extraction_and_smart_unpack() {
+        let mut gz_buf = Vec::new();
+        {
+            let enc = flate2::write::GzEncoder::new(&mut gz_buf, flate2::Compression::default());
+            let mut tar_builder = tar::Builder::new(enc);
+
+            let data1 = b"fn main() { println!(\"Hello TarGz\"); }";
+            let mut header1 = tar::Header::new_gnu();
+            header1.set_size(data1.len() as u64);
+            header1.set_mode(0o644);
+            header1.set_mtime(1700000000);
+            header1.set_cksum();
+            tar_builder
+                .append_data(&mut header1, "my_crate/src/main.rs", &data1[..])
+                .unwrap();
+
+            let data2 = b"[package]\nname = \"my_crate\"";
+            let mut header2 = tar::Header::new_gnu();
+            header2.set_size(data2.len() as u64);
+            header2.set_mode(0o644);
+            header2.set_mtime(1700000000);
+            header2.set_cksum();
+            tar_builder
+                .append_data(&mut header2, "my_crate/Cargo.toml", &data2[..])
+                .unwrap();
+
+            tar_builder.finish().unwrap();
+        }
+
+        let temp_dir = PathBuf::from("target/test_tar_tmp");
+        let _ = fs::create_dir_all(&temp_dir);
+        let targz_path = temp_dir.join("my_crate-1.0.tar.gz");
+        fs::write(&targz_path, gz_buf).unwrap();
+
+        // 1. Test smart-unpack (single root folder 'my_crate' -> extracts directly to temp_dir without double folder)
+        let res = extract_archive(&targz_path, &temp_dir, true, false, None).unwrap();
+        assert_eq!(res.extracted_files, 2);
+        assert!(
+            !res.smart_adjusted,
+            "Single root folder should not create redundant wrapper"
+        );
+        assert!(temp_dir
+            .join("my_crate")
+            .join("src")
+            .join("main.rs")
+            .exists());
+        assert_eq!(
+            fs::read_to_string(temp_dir.join("my_crate").join("src").join("main.rs")).unwrap(),
+            "fn main() { println!(\"Hello TarGz\"); }"
+        );
+
+        // 2. Test cat on the tar.gz
+        let mut cat_out = Vec::new();
+        crate::core::inspect::cat_archive_file(
+            &targz_path,
+            "my_crate/Cargo.toml",
+            None,
+            &mut cat_out,
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(cat_out).unwrap(),
+            "[package]\nname = \"my_crate\""
+        );
+
+        // 3. Test peek on the tar.gz
+        let peek = crate::core::inspect::peek_archive(&targz_path, 2, 50).unwrap();
+        assert_eq!(peek.total_entries, 2);
+        assert!(peek.has_single_root);
+        assert_eq!(peek.root_name.as_deref(), Some("my_crate"));
+
+        let _ = fs::remove_file(targz_path);
+        let _ = fs::remove_dir_all(temp_dir);
     }
 }
