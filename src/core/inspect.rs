@@ -29,7 +29,32 @@ pub struct PeekSummary {
     pub truncated_items: usize,
 }
 
-/// Fast inspection of an archive (.zip, .tar.gz, .tgz, .tar) without extracting any files.
+fn bound_extension_distribution(
+    raw: BTreeMap<String, usize>,
+    limit: usize,
+) -> BTreeMap<String, usize> {
+    if raw.len() <= limit {
+        return raw;
+    }
+    let mut sorted: Vec<(String, usize)> = raw.into_iter().collect();
+    sorted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+    let mut bounded = BTreeMap::new();
+    let mut other_count = 0;
+    for (i, (ext, count)) in sorted.into_iter().enumerate() {
+        if i < limit {
+            bounded.insert(ext, count);
+        } else {
+            other_count += count;
+        }
+    }
+    if other_count > 0 {
+        bounded.insert("(other)".to_string(), other_count);
+    }
+    bounded
+}
+
+/// Fast inspection of an archive (.zip, .tar.gz, .tgz, .tar, .gz) without extracting any files.
 /// Tailored for AI Agents to understand archive layout within strict token budgets.
 pub fn peek_archive(
     archive_path: &Path,
@@ -41,7 +66,56 @@ pub fn peek_archive(
         ArchiveFormat::Zip => peek_zip_archive(archive_path, depth_limit, count_limit),
         ArchiveFormat::TarGz => peek_tar_archive(archive_path, true, depth_limit, count_limit),
         ArchiveFormat::Tar => peek_tar_archive(archive_path, false, depth_limit, count_limit),
+        ArchiveFormat::Gz => peek_gz_archive(archive_path),
     }
+}
+
+fn peek_gz_archive(archive_path: &Path) -> Result<PeekSummary, Box<dyn std::error::Error>> {
+    let compressed_bytes = fs::metadata(archive_path)?.len();
+    let file = File::open(archive_path)?;
+    let mut gz = flate2::read::GzDecoder::new(file);
+
+    let inner_name = archive_stem_cleaned(archive_path);
+    let mut sink = io::sink();
+    let uncompressed_bytes = io::copy(&mut gz, &mut sink)?;
+
+    let mut extension_distribution = BTreeMap::new();
+    let ext = Path::new(&inner_name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| format!(".{}", e.to_lowercase()))
+        .unwrap_or_else(|| "(no ext)".to_string());
+    extension_distribution.insert(ext, 1);
+
+    let tree_summary = vec![TreeSummaryItem {
+        path: inner_name,
+        is_dir: false,
+        size: uncompressed_bytes,
+    }];
+
+    let ratio_num = if compressed_bytes > 0 {
+        uncompressed_bytes as f64 / compressed_bytes as f64
+    } else {
+        1.0
+    };
+    let compression_ratio = format!("{:.1}x", ratio_num);
+
+    Ok(PeekSummary {
+        archive_name: archive_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown")
+            .to_string(),
+        total_entries: 1,
+        total_compressed_bytes: compressed_bytes,
+        total_uncompressed_bytes: uncompressed_bytes,
+        compression_ratio,
+        has_single_root: true,
+        root_name: None,
+        extension_distribution,
+        tree_summary,
+        truncated_items: 0,
+    })
 }
 
 fn peek_zip_archive(
@@ -53,7 +127,7 @@ fn peek_zip_archive(
     let mut archive = ZipArchive::new(file)?;
     let archive_stem = archive_stem_cleaned(archive_path);
 
-    let smart_plan = plan_smart_unpack(&mut archive, &archive_stem, Path::new("."))?;
+    let smart_plan = plan_smart_unpack(&mut archive, &archive_stem, Path::new("."), None)?;
 
     let mut extension_distribution: BTreeMap<String, usize> = BTreeMap::new();
     let mut tree_summary = Vec::new();
@@ -111,7 +185,7 @@ fn peek_zip_archive(
         compression_ratio,
         has_single_root: smart_plan.has_single_root,
         root_name: smart_plan.root_name,
-        extension_distribution,
+        extension_distribution: bound_extension_distribution(extension_distribution, count_limit),
         tree_summary,
         truncated_items,
     })
@@ -200,7 +274,7 @@ fn peek_tar_archive(
         compression_ratio,
         has_single_root: smart_plan.has_single_root,
         root_name: smart_plan.root_name,
-        extension_distribution,
+        extension_distribution: bound_extension_distribution(extension_distribution, count_limit),
         tree_summary,
         truncated_items,
     })
@@ -219,7 +293,18 @@ pub fn cat_archive_file<W: Write>(
         ArchiveFormat::Zip => cat_zip_file(archive_path, target_entry_path, password, writer),
         ArchiveFormat::TarGz => cat_tar_file(archive_path, true, target_entry_path, writer),
         ArchiveFormat::Tar => cat_tar_file(archive_path, false, target_entry_path, writer),
+        ArchiveFormat::Gz => cat_gz_file(archive_path, writer),
     }
+}
+
+fn cat_gz_file<W: Write>(
+    archive_path: &Path,
+    writer: &mut W,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let file = File::open(archive_path)?;
+    let mut gz = flate2::read::GzDecoder::new(file);
+    io::copy(&mut gz, writer)?;
+    Ok(())
 }
 
 fn cat_zip_file<W: Write>(
@@ -231,39 +316,40 @@ fn cat_zip_file<W: Write>(
     let file = File::open(archive_path)?;
     let mut archive = ZipArchive::new(file)?;
 
-    let target_normalized = target_entry_path.replace('\\', "/");
+    let target_raw = target_entry_path.replace('\\', "/");
+    let target_normalized = crate::core::encoding::compose_hangul_nfc(&target_raw);
 
     for i in 0..archive.len() {
-        let name_normalized = {
-            let entry = archive.by_index(i)?;
-            super::encoding::decode_entry_name(entry.name_raw()).replace('\\', "/")
+        let mut entry = match password {
+            Some(pass) => match archive.by_index_decrypt(i, pass.as_bytes()) {
+                Ok(e) => e,
+                Err(ZipError::UnsupportedArchive(msg)) => {
+                    return Err(format!("Decryption failed: {}", msg).into());
+                }
+                Err(e) => return Err(Box::new(e)),
+            },
+            None => match archive.by_index(i) {
+                Ok(e) => e,
+                Err(ZipError::UnsupportedArchive(msg))
+                    if msg.contains("Password") || msg.contains("encrypted") =>
+                {
+                    return Err(
+                        "File is password-protected. Please supply --password <PASS>".into(),
+                    );
+                }
+                Err(e) => return Err(Box::new(e)),
+            },
         };
 
-        if name_normalized == target_normalized
+        let name_raw =
+            super::encoding::decode_entry_name(entry.name_raw()).replace('\\', "/");
+        let name_normalized = crate::core::encoding::compose_hangul_nfc(&name_raw);
+
+        if name_raw == target_raw
+            || name_normalized == target_normalized
             || name_normalized.trim_start_matches('/') == target_normalized.trim_start_matches('/')
             || name_normalized.eq_ignore_ascii_case(&target_normalized)
         {
-            let mut entry = match password {
-                Some(pass) => match archive.by_index_decrypt(i, pass.as_bytes()) {
-                    Ok(e) => e,
-                    Err(ZipError::UnsupportedArchive(msg)) => {
-                        return Err(format!("Decryption failed: {}", msg).into());
-                    }
-                    Err(e) => return Err(Box::new(e)),
-                },
-                None => match archive.by_index(i) {
-                    Ok(e) => e,
-                    Err(ZipError::UnsupportedArchive(msg))
-                        if msg.contains("Password") || msg.contains("encrypted") =>
-                    {
-                        return Err(
-                            "File is password-protected. Please supply --password <PASS>".into(),
-                        );
-                    }
-                    Err(e) => return Err(Box::new(e)),
-                },
-            };
-
             if entry.is_dir() {
                 return Err(format!("'{}' is a directory, not a file", target_entry_path).into());
             }
@@ -294,16 +380,19 @@ fn cat_tar_file<W: Write>(
         Box::new(file)
     };
     let mut tar = tar::Archive::new(reader);
-    let target_normalized = target_entry_path.replace('\\', "/");
+    let target_raw = target_entry_path.replace('\\', "/");
+    let target_normalized = crate::core::encoding::compose_hangul_nfc(&target_raw);
 
     for entry_res in tar.entries()? {
         let mut entry = entry_res?;
         let path_cow = entry.path()?;
         let raw_name = path_cow.to_string_lossy().to_string();
+        let name_raw = raw_name.replace('\\', "/");
         let name_normalized =
-            crate::core::encoding::compose_hangul_nfc(&raw_name).replace('\\', "/");
+            crate::core::encoding::compose_hangul_nfc(&name_raw);
 
-        if name_normalized == target_normalized
+        if name_raw == target_raw
+            || name_normalized == target_normalized
             || name_normalized.trim_start_matches('/') == target_normalized.trim_start_matches('/')
             || name_normalized.eq_ignore_ascii_case(&target_normalized)
         {

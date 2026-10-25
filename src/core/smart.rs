@@ -104,12 +104,34 @@ pub fn plan_smart_unpack<R: Read + Seek>(
     archive: &mut ZipArchive<R>,
     archive_stem: &str,
     output_base: &Path,
+    password: Option<&str>,
 ) -> Result<SmartUnpackPlan, Box<dyn std::error::Error>> {
     let total_entries = archive.len();
     let mut entries_info = Vec::with_capacity(total_entries);
 
     for i in 0..total_entries {
-        let entry = archive.by_index(i)?;
+        let entry = match password {
+            Some(pass) => match archive.by_index_decrypt(i, pass.as_bytes()) {
+                Ok(e) => e,
+                Err(zip::result::ZipError::UnsupportedArchive(msg)) => {
+                    return Err(format!("Decryption failed: {}", msg).into());
+                }
+                Err(e) => return Err(Box::new(e)),
+            },
+            None => match archive.by_index(i) {
+                Ok(e) => e,
+                Err(zip::result::ZipError::UnsupportedArchive(msg))
+                    if msg.contains("Password") || msg.contains("encrypted") =>
+                {
+                    return Err(
+                        "Archive entry is password-protected. Please supply --password <PASS>"
+                            .into(),
+                    );
+                }
+                Err(e) => return Err(Box::new(e)),
+            },
+        };
+
         let raw_name = crate::core::encoding::decode_entry_name(entry.name_raw());
         let is_dir = entry.is_dir() || raw_name.ends_with('/') || raw_name.ends_with('\\');
         entries_info.push(LayoutEntryInfo {
@@ -175,7 +197,7 @@ mod tests {
         }
 
         let mut archive = ZipArchive::new(Cursor::new(buf)).unwrap();
-        let plan = plan_smart_unpack(&mut archive, "my_archive", Path::new("C:\\out")).unwrap();
+        let plan = plan_smart_unpack(&mut archive, "my_archive", Path::new("C:\\out"), None).unwrap();
         assert!(plan.has_single_root);
         assert_eq!(plan.root_name.as_deref(), Some("my_project"));
         assert_eq!(plan.target_dir, Path::new("C:\\out"));
@@ -193,7 +215,7 @@ mod tests {
         }
 
         let mut archive = ZipArchive::new(Cursor::new(buf)).unwrap();
-        let plan = plan_smart_unpack(&mut archive, "my_archive", Path::new("C:\\out")).unwrap();
+        let plan = plan_smart_unpack(&mut archive, "my_archive", Path::new("C:\\out"), None).unwrap();
         assert!(!plan.has_single_root);
         assert_eq!(plan.target_dir, Path::new("C:\\out").join("my_archive"));
     }
@@ -209,7 +231,7 @@ mod tests {
         }
 
         let mut archive = ZipArchive::new(Cursor::new(buf)).unwrap();
-        let plan = plan_smart_unpack(&mut archive, "doc", Path::new("C:\\out")).unwrap();
+        let plan = plan_smart_unpack(&mut archive, "doc", Path::new("C:\\out"), None).unwrap();
         assert!(!plan.has_single_root);
         assert_eq!(plan.target_dir, Path::new("C:\\out").join("doc"));
     }

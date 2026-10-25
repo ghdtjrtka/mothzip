@@ -100,15 +100,30 @@ pub fn pack_archive(
         }
     }
 
-    let result = (|| -> Result<PackSummary, Box<dyn std::error::Error>> {
-        if let Some(parent) = dest_zip.parent() {
-            if !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent)?;
-            }
-        }
+    let parent = dest_zip.parent().unwrap_or(Path::new("."));
+    if !parent.as_os_str().is_empty() {
+        fs::create_dir_all(parent)?;
+    }
 
-        let file = File::create(dest_zip)?;
+    let file_name = dest_zip
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("archive.zip");
+    let staging_token = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let staging_zip = parent.join(format!(
+        ".mothzip_pack_{}_{}_{}",
+        std::process::id(),
+        staging_token,
+        file_name
+    ));
+
+    let result = (|| -> Result<PackSummary, Box<dyn std::error::Error>> {
+        let file = File::create(&staging_zip)?;
         let canonical_dest = dest_zip.canonicalize().ok();
+        let canonical_staging = staging_zip.canonicalize().ok();
         let mut zip = ZipWriter::new(file);
 
         let base_options = SimpleFileOptions::default()
@@ -131,6 +146,13 @@ pub fn pack_archive(
                 if let Some(ref cdest) = canonical_dest {
                     if let Ok(csource) = clean_source.canonicalize() {
                         if csource == *cdest {
+                            continue;
+                        }
+                    }
+                }
+                if let Some(ref cstage) = canonical_staging {
+                    if let Ok(csource) = clean_source.canonicalize() {
+                        if csource == *cstage {
                             continue;
                         }
                     }
@@ -176,6 +198,13 @@ pub fn pack_archive(
                             }
                         }
                     }
+                    if let Some(ref cstage) = canonical_staging {
+                        if let Ok(cpath) = path.canonicalize() {
+                            if cpath == *cstage {
+                                continue;
+                            }
+                        }
+                    }
 
                     let relative = path.strip_prefix(base_parent)?;
                     let raw_name = relative.to_string_lossy().replace('\\', "/");
@@ -212,6 +241,12 @@ pub fn pack_archive(
 
         let finished_file = zip.finish()?;
         let compressed_bytes = finished_file.metadata()?.len();
+        drop(finished_file);
+
+        if dest_zip.exists() {
+            let _ = fs::remove_file(dest_zip);
+        }
+        fs::rename(&staging_zip, dest_zip)?;
 
         let ratio_num = if compressed_bytes > 0 {
             total_uncompressed_bytes as f64 / compressed_bytes as f64
@@ -229,9 +264,9 @@ pub fn pack_archive(
         })
     })();
 
-    // Transactional safety: remove incomplete destination zip if packing failed
-    if result.is_err() && dest_zip.exists() {
-        let _ = fs::remove_file(dest_zip);
+    // Transactional safety: remove incomplete staging zip if packing failed
+    if result.is_err() && staging_zip.exists() {
+        let _ = fs::remove_file(&staging_zip);
     }
 
     result
