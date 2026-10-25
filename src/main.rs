@@ -33,13 +33,33 @@ fn main() -> ExitCode {
             to_folder,
         } => {
             let out_dir = resolve_output_dir(archive, out);
-            match core::extract::extract_archive(
+            let mut pass = password.clone();
+            let mut res = core::extract::extract_archive(
                 archive,
                 &out_dir,
                 true,
                 *to_folder,
-                password.as_deref(),
-            ) {
+                pass.as_deref(),
+            );
+
+            // Interactive password prompt for human terminal users
+            if let Err(ref e) = res {
+                if pass.is_none() && is_password_error(&e.to_string()) {
+                    let arch_name = archive.file_name().and_then(|s| s.to_str()).unwrap_or("archive");
+                    if let Some(prompted) = prompt_password(arch_name, cli.json) {
+                        pass = Some(prompted);
+                        res = core::extract::extract_archive(
+                            archive,
+                            &out_dir,
+                            true,
+                            *to_folder,
+                            pass.as_deref(),
+                        );
+                    }
+                }
+            }
+
+            match res {
                 Ok(summary) => {
                     report_extract(&summary, cli.json, cli.quiet);
                     Ok(())
@@ -54,13 +74,32 @@ fn main() -> ExitCode {
             to_folder,
         } => {
             let out_dir = resolve_output_dir(archive, out);
-            match core::extract::extract_archive(
+            let mut pass = password.clone();
+            let mut res = core::extract::extract_archive(
                 archive,
                 &out_dir,
                 false,
                 *to_folder,
-                password.as_deref(),
-            ) {
+                pass.as_deref(),
+            );
+
+            if let Err(ref e) = res {
+                if pass.is_none() && is_password_error(&e.to_string()) {
+                    let arch_name = archive.file_name().and_then(|s| s.to_str()).unwrap_or("archive");
+                    if let Some(prompted) = prompt_password(arch_name, cli.json) {
+                        pass = Some(prompted);
+                        res = core::extract::extract_archive(
+                            archive,
+                            &out_dir,
+                            false,
+                            *to_folder,
+                            pass.as_deref(),
+                        );
+                    }
+                }
+            }
+
+            match res {
                 Ok(summary) => {
                     report_extract(&summary, cli.json, cli.quiet);
                     Ok(())
@@ -101,13 +140,30 @@ fn main() -> ExitCode {
             path,
             password,
         } => {
+            let mut pass = password.clone();
             let mut stdout = io::stdout().lock();
-            let res = core::inspect::cat_archive_file(
+            let mut res = core::inspect::cat_archive_file(
                 archive,
                 path,
-                password.as_deref(),
+                pass.as_deref(),
                 &mut stdout,
             );
+
+            if let Err(ref e) = res {
+                if pass.is_none() && is_password_error(&e.to_string()) {
+                    let arch_name = archive.file_name().and_then(|s| s.to_str()).unwrap_or("archive");
+                    if let Some(prompted) = prompt_password(arch_name, cli.json) {
+                        pass = Some(prompted);
+                        res = core::inspect::cat_archive_file(
+                            archive,
+                            path,
+                            pass.as_deref(),
+                            &mut stdout,
+                        );
+                    }
+                }
+            }
+
             let _ = stdout.flush();
             res
         }
@@ -142,4 +198,26 @@ fn resolve_output_dir(archive: &Path, out: &Option<PathBuf>) -> PathBuf {
     } else {
         PathBuf::from(".")
     }
+}
+
+fn is_password_error(msg: &str) -> bool {
+    msg.contains("password-protected")
+        || msg.contains("Password")
+        || msg.contains("encrypted")
+        || msg.contains("Decryption failed")
+}
+
+fn prompt_password(archive_name: &str, is_json: bool) -> Option<String> {
+    use std::io::IsTerminal;
+    if !is_json && io::stdin().is_terminal() {
+        eprint!("🔑 Enter password for '{}': ", archive_name);
+        let mut buf = String::new();
+        if io::stdin().read_line(&mut buf).is_ok() {
+            let pass = buf.trim_end_matches(['\r', '\n']).to_string();
+            if !pass.is_empty() {
+                return Some(pass);
+            }
+        }
+    }
+    None
 }

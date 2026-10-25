@@ -170,12 +170,25 @@ pub fn extract_archive(
                 }
             }
 
-            let mut outfile = File::create(&dest_path)?;
+            let mut outfile = File::create(&dest_path).map_err(|e| {
+                format!(
+                    "Failed to create destination file '{}': {}",
+                    dest_path.display(),
+                    e
+                )
+            })?;
 
-            // Defend against deceptive stream zip-bombs
+            // Defend against deceptive stream zip-bombs and clean up on mid-stream failure
             let max_entry_bytes = entry.size() + 4096;
             let mut limited = (&mut entry).take(max_entry_bytes + 1);
-            let written = io::copy(&mut limited, &mut outfile)?;
+            let written = match io::copy(&mut limited, &mut outfile) {
+                Ok(w) => w,
+                Err(e) => {
+                    drop(outfile);
+                    let _ = fs::remove_file(&dest_path);
+                    return Err(format!("Extraction error on '{}': {}", raw_name, e).into());
+                }
+            };
 
             if written > max_entry_bytes {
                 let _ = fs::remove_file(&dest_path);

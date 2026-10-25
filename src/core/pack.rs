@@ -113,7 +113,9 @@ pub fn pack_archive(
             }
 
             zip.start_file(file_name, opts)?;
-            let mut f = File::open(source)?;
+            let mut f = File::open(source).map_err(|e| {
+                format!("Failed to open file '{}' for packing: {}", source.display(), e)
+            })?;
             let written = io::copy(&mut f, &mut zip)?;
 
             total_uncompressed_bytes += written;
@@ -153,7 +155,9 @@ pub fn pack_archive(
                     zip.add_directory(format!("{}/", name), opts)?;
                 } else if entry.file_type().is_file() {
                     zip.start_file(name, opts)?;
-                    let mut f = File::open(path)?;
+                    let mut f = File::open(path).map_err(|e| {
+                        format!("Failed to open file '{}' for packing: {}", path.display(), e)
+                    })?;
                     let written = io::copy(&mut f, &mut zip)?;
 
                     total_uncompressed_bytes += written;
