@@ -32,24 +32,36 @@ Eliminates desktop and folder clutter automatically:
 * **Single Root Archive**: If all files are already wrapped inside a root directory (e.g., `myapp/...`), extracts directly to target without redundant nesting.
 * **Flat / Loose Files Archive**: If multiple files or directories are loose at the root, automatically creates a dedicated subfolder (`dest/archive_name/...`) to keep your directory clean.
 
-### 2. 한국어 CP949 / EUC-KR 자동 감지 및 무결 복원
-* 구버전 알집, 윈도우 탐색기, 공공기관 등에서 UTF-8 플래그 없이 압축된 한글 파일명을 자동 감지하여 깨짐 없이 원본 그대로 복원합니다.
+### 2. 한국어 CP949 / EUC-KR 및 macOS NFD 한글 자모 분리 완벽 해결
+* **CP949/EUC-KR 자동 감지**: 구버전 알집, 윈도우 탐색기, 공공기관 등에서 UTF-8 플래그 없이 압축된 한글 파일명을 자동 감지하여 깨짐 없이 원본 그대로 복원합니다.
+* **macOS NFD 한글 자모 조합 (NFC)**: Mac에서 생성된 아카이브(`ㅎㅏㄴㄱㅡㄹ.txt`)를 유니코드 표준 부록 #15(UAX #15) 수학적 공식 기반으로 순수 Rust에서 자체 조합하여 탐색기에서 온전한 `한글.txt`로 복원합니다.
 
-### 3. 암호화 아카이브 (AES-256 / ZipCrypto) 완벽 지원
+### 3. Windows 앱 및 탐색기 우클릭 등록 (Start Menu & Settings)
+* `mothzip register` 한 번으로:
+  * **탐색기 우클릭 메뉴**: .zip에 `알아서 풀기 (&MothZip)`, `여기에 풀기`, `각각 폴더에 풀기`, 일반 파일/폴더에 `ZIP으로 압축 (&MothZip)` 등록
+  * **시작 메뉴 바로가기**: 나방 아이콘이 적용된 `MothZip (나방집)` 바로가기 자동 생성
+  * **설정 > 앱 > 설치된 앱**: 나방 아이콘과 함께 제어판/설정에 정식 앱으로 등록 (`mothzip unregister` 간편 삭제 지원)
+  * **실행 창 (`Win + R`)**: `mothzip` 명령어로 즉시 호출 가능
+
+### 4. 암호화 아카이브 (AES-256 / ZipCrypto) 및 대화형 프롬프트
 * `-p, --password <PASS>` 옵션을 통해 WinZip AES-128, AES-256 및 전통적인 ZipCrypto 암호화 아카이브를 완벽하게 해제하고 검사할 수 있습니다.
+* 터미널에서 비밀번호를 생략하고 실행한 경우, 즉석에서 안전하게 비밀번호를 입력할 수 있는 대화형 프롬프트를 지원합니다 (AI 에이전트 모드에서는 데드락 없이 즉시 JSON 에러 반환).
 
-### 4. 파일 수정 시각 (Timestamp) 및 속성 완벽 보존
-* 압축 파일 내부에 기록된 원본 수정 시간(mtime)을 2초 정밀도로 완벽 복원합니다.
-* 기존 파일이 읽기 전용(Read-Only) 속성을 가지고 있더라도 덮어쓰기 시 권한 충돌 없이 안전하게 교체합니다.
+### 5. 무결점 트랜잭션 안전성 및 파일 수정 시각 (Timestamp) 보존
+* **트랜잭션 롤백**: 디스크 풀이나 CRC 오류 등 추출/압축 도중 장애 발생 시 미완성 쓰레기 파일을 즉시 자동 삭제하여 디스크 오염을 방지합니다.
+* **수정 시각 완벽 복원**: 압축 파일 내부에 기록된 원본 수정 시간(mtime)을 Howard Hinnant 알고리즘으로 2초 정밀도로 완벽 복원합니다.
+* **읽기 전용 속성 자동 조정**: 대상 파일이 Read-Only 속성을 가지고 있더라도 권한 충돌 없이 안전하게 교체합니다.
 
-### 5. 에이전틱 모드 (Agentic CLI)
+### 6. 에이전틱 모드 (Agentic CLI)
 * **`mothzip peek <archive.zip> --json`**: 아카이브를 풀지 않고 중앙 디렉터리만 읽어 파일 수, 압축률, 확장자 통계, 깊이 제한 트리를 JSON으로 1ms 내 반환.
 * **`mothzip cat <archive.zip> <internal/path>`**: 원하는 파일 1개만 메모리에서 즉시 `stdout`으로 스트리밍.
 * **다층 방탄 보안 가드 (Adversarial Security Guards)**:
   * **Zip-Slip 차단**: 상대경로(`..`) 및 절대경로 탈출 완전 방어.
-  * **Windows DOS 예약 장치명 차단**: `CON`, `PRN`, `AUX`, `NUL`, `COM1..9`, `LPT1..9` 등 윈도우 디바이스 드라이버 파일 생성 차단.
+  * **Windows DOS 예약 장치명 차단**: `CON`, `PRN`, `AUX`, `NUL`, `COM1..9`, `LPT1..9`, `CLOCK$` 등 윈도우 디바이스 드라이버 파일 생성 차단.
   * **NTFS 대체 데이터 스트림 (ADS) 차단**: 콜론(`:`) 스트림 백도어 방어.
+  * **크로스플랫폼 특수문자 정제**: Linux 등에서 생성된 `< > " | ? *` 파일명을 안전한 `_`로 치환하여 OS Error 123 방지.
   * **기만형 스트리밍 압축폭탄 차단**: 헤더 크기를 거짓 기재하여 실제로는 거대한 데이터를 쏟아내는 압축폭탄을 스트림 레벨에서 강제 차단.
+  * **미존재 원본 및 자기 압축 방어**: 압축 전 원본 파일 실존 여부 및 자기 자신을 압축 파일로 덮어쓰는 오류 사전 차단.
 
 ---
 
