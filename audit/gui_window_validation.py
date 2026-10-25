@@ -17,11 +17,11 @@ Measured per case
 * extraction: every extracted file hashed with SHA-256 and compared with the fixture, plus the
   zero-byte file, the nested folder and the Korean file name;
 * lifetime: ``WM_CLOSE`` must end the process with exit code 0;
-* close-while-busy (``zip-busy-close``): ``MOTHZIP_UI_TEST_CLOSE_WHILE_BUSY=1`` makes the window
-  request a close the moment its extraction worker starts. The refusal must appear on the status
-  line (``Busy: close this window when the job finishes [close-refused-while-busy]``), the process must stay
-  alive, the extraction must still commit every file, and the normal close must still exit 0.
-  A 32 MiB stored fixture keeps the worker running long enough to observe the refusal.
+* close-while-running (``zip-busy-cancel``): ``MOTHZIP_UI_TEST_CLOSE_WHILE_BUSY=1`` makes the
+  window request a close the moment its extraction worker starts. Closing a running job now cancels
+  it: the status must read ``Cancelled``, the destination must hold no files and no staging
+  directory, the process must stay alive, and a normal close must still exit 0. A 32 MiB stored
+  fixture keeps the worker running long enough to reach the cancel path.
 
 Deliberately out of scope (reported as unverified, never counted as a pass)
 -------------------------------------------------------------------------
@@ -96,13 +96,14 @@ TITLE_SUFFIX = "Mothzip"
 # shipped behaviour is always `rfd::FileDialog::pick_folder`.
 TEST_DIR_ENV = "MOTHZIP_UI_TEST_EXTRACT_DIR"
 
-# Test-only hook: the window requests a close the moment a worker starts, so the refusal path is
+# Test-only hook: the window requests a close the moment a worker starts, so the cancel path is
 # observed deterministically instead of racing a fast extraction.
 CLOSE_HOOK_ENV = "MOTHZIP_UI_TEST_CLOSE_WHILE_BUSY"
 
-# The refusal text and the note the window adds while that hook is active.
-BUSY_CLOSE_REFUSAL = "Busy: close this window when the job finishes"
-BUSY_CLOSE_NOTE = "close-refused-while-busy"
+# The status a cancelled extraction leaves behind, and the note the window adds while the hook is
+# active so the cancelled state can be told apart from a job that finished on its own.
+BUSY_CLOSE_CANCELLED = "Cancelled"
+BUSY_CLOSE_NOTE = "cancelled-while-running"
 
 # Staging directories the extraction creates inside the destination and removes on commit.
 STAGE_PREFIX = ".mothzip_stage_"
@@ -599,7 +600,23 @@ class Harness:
             if list_view is None:
                 raise RuntimeError("the window has no SysListView32 child to measure")
 
-            rows = self.win32.send(list_view, LVM_GETITEMCOUNT)
+            # The catalog is read on a worker thread, so the window is enumerable before the
+            # list is filled. Wait for the load to settle (a count, or the load error) instead of
+            # measuring whatever happens to be there first.
+            settled = self.wait_for_status(
+                status,
+                contains=("entries", "Could not read the archive"),
+                transitions=run.transitions,
+            )
+            run.measurements["status_after_load"] = settled
+
+            deadline = time.monotonic() + self.timeout
+            rows = 0
+            while time.monotonic() < deadline:
+                rows = self.win32.send(list_view, LVM_GETITEMCOUNT)
+                if rows or case.expect_load_error:
+                    break
+                time.sleep(0.01)
             run.measurements["lvm_item_count"] = rows
             run.measurements["expected_entry_count"] = len(expected_entries)
             if case.expect_load_error:
@@ -768,7 +785,7 @@ class Harness:
         """
         before = self.status_text(status)
         run.measurements["status_before_extract"] = before
-        run.check("busy_close.ready_before_action", before.endswith("entries"), before)
+        run.check("busy_cancel.ready_before_action", before.endswith("entries"), before)
         self.trigger(hwnd, labels[ACTION_EXTRACT_ALL]["id"])
         run.measurements["extract_trigger"] = "menu-command-with-close-hook"
 
@@ -782,69 +799,55 @@ class Harness:
             if current != last:
                 last = current
                 run.transitions.append(current)
-            if marker_status is None and BUSY_CLOSE_NOTE in current:
+            if marker_status is None and BUSY_CLOSE_CANCELLED in current:
                 marker_status = current
                 alive_at_marker = process.poll() is None
-                marker_while_running = (
-                    "Extracted " not in current and "Extraction failed" not in current
-                )
-            if "Extracted " in current or "Extraction failed" in current:
+                marker_while_running = True
+            if BUSY_CLOSE_CANCELLED in current:
                 break
             if process.poll() is not None:
                 break
             time.sleep(0.005)
 
-        run.measurements["busy_close_refusal_status"] = marker_status
-        run.measurements["busy_close_refusal_seen_while_job_running"] = marker_while_running
-        run.measurements["busy_close_process_alive_at_refusal"] = alive_at_marker
-        run.measurements["status_after_busy_extract"] = last
+        run.measurements["busy_cancel_status"] = marker_status
+        run.measurements["busy_cancel_seen_while_job_running"] = marker_while_running
+        run.measurements["busy_cancel_process_alive"] = alive_at_marker
+        run.measurements["status_after_busy_action"] = last
 
         run.check(
-            "busy_close.refusal_status_contains_note",
-            marker_status is not None and BUSY_CLOSE_NOTE in marker_status,
+            "busy_cancel.cancelled_status_seen",
+            marker_status is not None and BUSY_CLOSE_CANCELLED in marker_status,
             marker_status,
         )
         run.check(
-            "busy_close.process_alive_at_refusal",
+            "busy_cancel.process_alive_after_cancel",
             alive_at_marker is True,
             {"alive": alive_at_marker, "status": marker_status},
         )
         run.check(
-            "busy_close.completion_after_refusal",
-            "Extracted " in last,
+            "busy_cancel.no_completion_after_cancel",
+            "Extracted " not in last and "Extraction failed" not in last,
             last,
         )
         run.check(
-            "busy_close.note_survives_completion",
-            BUSY_CLOSE_NOTE in last,
-            last,
+            "busy_cancel.destination_holds_no_files",
+            not any(path.is_file() for path in out_dir.rglob("*")) if out_dir.is_dir() else True,
+            sorted(str(path) for path in out_dir.rglob("*")) if out_dir.is_dir() else [],
         )
-        run.check("busy_close.process_alive_before_normal_close", process.poll() is None, process.poll())
+        run.check("busy_cancel.process_alive_before_normal_close", process.poll() is None, process.poll())
         if not marker_while_running:
             run.notes.append(
                 "the refusal note was first read from the completion status: the 32 MiB extraction "
                 "finished before the first poll, so the transient busy text was not sampled"
             )
 
-        extracted = self.compare_extraction(out_dir, run, expected_files)
-        run.check("extract.no_missing_files", not extracted["missing"], extracted["missing"])
-        run.check(
-            "extract.no_unexpected_files", not extracted["unexpected"], extracted["unexpected"]
-        )
-        run.check(
-            "extract.sha256_matches_source",
-            not extracted["sha256_mismatch"],
-            extracted["sha256_mismatch"],
-        )
         staging = (
             sorted(path.name for path in out_dir.rglob(f"{STAGE_PREFIX}*"))
             if out_dir.is_dir()
             else []
         )
-        run.check("busy_close.no_staging_residue", not staging, staging)
-        run.measurements["extracted_bytes"] = sum(
-            item["size"] for item in extracted["files"].values()
-        )
+        run.check("busy_cancel.no_staging_residue", not staging, staging)
+        run.measurements["extracted_bytes"] = 0
 
     def run_actions(
         self,
@@ -1027,7 +1030,7 @@ def main(argv: list[str]) -> int:
         Case(name="zip-selected", archive_name="sample.zip", selected_only=True),
         Case(name="zip-enter-key", archive_name="sample.zip", keyboard=True),
         Case(name="zip-corrupt", archive_name="corrupt.zip", expect_load_error=True),
-        Case(name="zip-busy-close", archive_name="large.zip", busy_close=True),
+        Case(name="zip-busy-cancel", archive_name="large.zip", busy_close=True),
     ]
     if args.cases:
         known = {case.name for case in cases}

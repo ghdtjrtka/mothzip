@@ -17,7 +17,7 @@ use windows_sys::Win32::Foundation::{
     GetLastError, ERROR_CLASS_ALREADY_EXISTS, FALSE, HWND, LPARAM, LRESULT, TRUE, WPARAM,
 };
 use windows_sys::Win32::Graphics::Gdi::UpdateWindow;
-use windows_sys::Win32::Graphics::Gdi::{COLOR_WINDOW, HBRUSH};
+use windows_sys::Win32::Graphics::Gdi::{InvalidateRect, COLOR_WINDOW, HBRUSH};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Controls::WC_STATICW;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{SetFocus, VK_ESCAPE, VK_RETURN};
@@ -31,11 +31,11 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, FVIRTKEY, GWLP_USERDATA, HACCEL, HMENU,
     IDC_ARROW, IDI_APPLICATION, MF_BYCOMMAND, MF_ENABLED, MF_GRAYED, MF_POPUP, MF_SEPARATOR,
     MF_STRING, MSG, PM_REMOVE, SM_CYMENU, SWP_NOMOVE, SWP_NOZORDER, SW_SHOW, WM_CLOSE, WM_COMMAND,
-    WM_CREATE, WM_DESTROY, WM_QUIT, WM_SETFONT, WM_SIZE, WNDCLASSEXW, WS_CHILD,
+    WM_CREATE, WM_DESTROY, WM_QUIT, WM_SETFONT, WM_SETREDRAW, WM_SIZE, WNDCLASSEXW, WS_CHILD,
     WS_OVERLAPPEDWINDOW, WS_VISIBLE,
 };
 
-use crate::core::catalog::{read_archive_catalog, CatalogEntry};
+use crate::core::catalog::CatalogEntry;
 
 use job::{JobKind, JobOutcome, JobRequest, JobResult};
 
@@ -69,12 +69,20 @@ const ID_EXTRACT_ALL: u32 = 1001;
 const ID_EXTRACT_SELECTED: u32 = 1002;
 const ID_TEST: u32 = 1003;
 const ID_CLOSE: u32 = 1004;
+const ID_CANCEL: u32 = 1005;
 
 /// The low word of a message parameter, where a `WM_COMMAND` command id arrives.
 const LOWORD_MASK: WPARAM = 0xFFFF;
 
-/// What a refused close says: the worker owns the destination until it commits or cleans up, so
-/// the window must stay alive. The running label returns when the worker finishes.
+/// Status line from the moment the window opens until the catalog arrives: the read runs on a
+/// worker thread, so this is what the user sees instead of a frozen window.
+const LOADING_STATUS: &str = "Loading…";
+
+/// Status line after the user stopped a job.
+const CANCELLED_STATUS: &str = "Cancelled";
+
+/// What a refused close says: the integrity check owns the archive until it reports, so the window
+/// must stay alive; its result returns to the status line.
 const CLOSE_WHILE_BUSY_MESSAGE: &str = "Busy: close this window when the job finishes";
 
 /// Test-only override: when set, an extraction writes here instead of opening the folder picker.
@@ -83,13 +91,19 @@ const TEST_EXTRACT_DIR_ENV: &str = "MOTHZIP_UI_TEST_EXTRACT_DIR";
 
 /// Test-only harness hook: `1` makes the first command that starts a worker also request
 /// `WM_CLOSE` once, right after the worker started. The request is synchronous on this thread, so
-/// it cannot race the job: the production refusal path runs deterministically. The refusal text
-/// then carries [`TEST_CLOSE_REFUSED_NOTE`] for a harness to read. Nothing changes unless an
+/// it cannot race the job: the production path runs deterministically. While an extraction runs
+/// that request is the cancellation path, and a running integrity check refuses it and carries
+/// [`TEST_CLOSE_REFUSED_NOTE`] on the status line for a harness to read. Nothing changes unless an
 /// automated check sets it.
 const TEST_CLOSE_WHILE_BUSY_ENV: &str = "MOTHZIP_UI_TEST_CLOSE_WHILE_BUSY";
 
-/// Status-line note proving a close request was refused while a worker owned the archive.
+/// Status-line note proving a close request was refused while an integrity check owned the
+/// archive.
 const TEST_CLOSE_REFUSED_NOTE: &str = "close-refused-while-busy";
+
+/// Status line when the catalog worker ended without reporting; the window stays open with the
+/// same "could not read" contract as any other load failure.
+const LOAD_WORKER_SILENT: &str = "The worker did not report a result";
 
 /// One window's state.
 ///
@@ -109,10 +123,17 @@ struct App {
     /// True once `WM_CREATE` ran; a window that reached it is destroyed by the system, menu
     /// included, when the procedure returns -1.
     created: bool,
-    /// True once `read_archive_catalog` succeeded. Every action is gated on this together with
-    /// [`App::busy`], so a corrupt or undecodable archive never enables extraction.
+    /// True once a catalog arrived. Every action is gated on this together with [`App::busy`],
+    /// so a corrupt or undecodable archive never enables extraction.
     loaded: bool,
-    /// True while a worker owns the archive; close requests are refused during that time.
+    /// True while the catalog worker reads the archive: the list is still empty and every action
+    /// is off, which is the same state a failed load leaves behind.
+    loading: bool,
+    /// Worker of the catalog read in flight; joined when the window closes after it finished, or
+    /// detached when it is still reading.
+    load_job: Option<job::LoadJob>,
+    /// True while a worker owns the archive; before it can close, a running extraction is
+    /// cancelled and a running integrity check is refused.
     busy: bool,
     /// Worker of the job in flight; joined before the state is released or the process exits.
     job: Option<job::Job>,
@@ -141,6 +162,8 @@ impl App {
             entries: Vec::new(),
             created: false,
             loaded: false,
+            loading: false,
+            load_job: None,
             busy: false,
             job: None,
             job_failed: false,
@@ -161,18 +184,28 @@ impl App {
     }
 
     /// The one rule behind the menu, the accelerators and the post-job refresh: an action is
-    /// available only when a catalog loaded and no worker owns the archive.
+    /// available only when a catalog arrived and no worker owns the archive.
     fn actions_available(&self) -> bool {
-        self.loaded && !self.busy
+        self.loaded && !self.busy && !self.loading
     }
 
-    /// Apply [`App::actions_available`] to the menu; `닫기` stays reachable so the window can
-    /// always be dismissed once the worker is done.
+    /// Whether the running job can be stopped; see [`JobKind::cancellable`].
+    fn cancellable(&self) -> bool {
+        self.busy && self.job.as_ref().is_some_and(job::Job::cancellable)
+    }
+
+    /// Apply [`App::actions_available`] and [`App::cancellable`] to the menu; `닫기`/`Close` stays
+    /// reachable so the window can always be dismissed once the worker is done.
     fn sync_actions(&self) {
         if self.menu.is_null() {
             return;
         }
-        let flag = if self.actions_available() {
+        let action_flag = if self.actions_available() {
+            MF_ENABLED
+        } else {
+            MF_GRAYED
+        };
+        let cancel_flag = if self.cancellable() {
             MF_ENABLED
         } else {
             MF_GRAYED
@@ -180,28 +213,94 @@ impl App {
         // SAFETY: `menu` is the menu installed on `window` and outlives every call.
         unsafe {
             for id in [ID_EXTRACT_ALL, ID_EXTRACT_SELECTED, ID_TEST] {
-                EnableMenuItem(self.menu, id, MF_BYCOMMAND | flag);
+                EnableMenuItem(self.menu, id, MF_BYCOMMAND | action_flag);
             }
+            EnableMenuItem(self.menu, ID_CANCEL, MF_BYCOMMAND | cancel_flag);
             DrawMenuBar(self.window);
         }
     }
 
-    /// Read the catalog and fill the list. A failure stays on screen: the window is already open,
-    /// and closing it would throw away the only place the reason can be shown.
-    fn load_catalog(&mut self) {
-        match read_archive_catalog(&self.archive, self.password.as_deref(), self.max_bytes) {
+    /// Start reading the catalog on a worker thread.
+    ///
+    /// The window is already on screen and its message loop starts right after this, so the read
+    /// never runs on the thread that pumps messages: the status line says `Loading…` and the
+    /// posted notification brings the entries back here, where the list is filled.
+    fn begin_load(&mut self) {
+        let request = job::LoadRequest {
+            archive: self.archive.clone(),
+            password: self.password.clone(),
+            max_bytes: self.max_bytes,
+        };
+        match job::spawn_load(self.window, request) {
+            Ok(loader) => {
+                self.load_job = Some(loader);
+                self.loading = true;
+                self.set_status(LOADING_STATUS);
+                self.sync_actions();
+            }
+            Err(error) => {
+                // No thread means no catalog: keep the failed-load contract instead of a window
+                // that never finishes loading.
+                self.apply_catalog(Err(error.to_string()));
+            }
+        }
+    }
+
+    /// Take the entries the catalog worker read and hand them to the list.
+    fn on_load_done(&mut self, notification: WPARAM) {
+        let Some(loader) = self.load_job.as_ref() else {
+            return;
+        };
+        if loader.id() != notification as u64 {
+            // A notification from an earlier load (its window is gone): not our result.
+            return;
+        }
+        let Some(loader) = self.load_job.take() else {
+            return;
+        };
+        match loader.finish() {
+            Some(outcome) => self.apply_catalog(outcome),
+            None => self.apply_catalog(Err(LOAD_WORKER_SILENT.to_string())),
+        }
+    }
+
+    /// Apply one load outcome and end the load. The list is filled here, on the thread that owns
+    /// the control; a failure stays on screen, because the window is already open and closing it
+    /// would throw away the only place the reason can be shown.
+    fn apply_catalog(&mut self, outcome: Result<Vec<CatalogEntry>, String>) {
+        self.loading = false;
+        match outcome {
             Ok(entries) => {
                 self.entries = entries;
                 self.loaded = true;
                 let visible = self.entries.len().min(MAX_ROWS);
+                // A repaint per inserted row is what turns a large fill into a tens-of-seconds
+                // stall; suppressing redraw for the fill and painting once at the end measured
+                // 5.3 s against 41 s for the same 30 000-row catalog.
+                // SAFETY: `list` is this window's live child control and the message only changes
+                // its redraw state.
+                unsafe {
+                    SendMessageW(self.list, WM_SETREDRAW, FALSE as WPARAM, 0);
+                }
                 list_view::populate(self.list, &self.entries[..visible]);
                 let shown = list_view::row_count(self.list);
+                // SAFETY: as above; one invalidate repaints the control after the fill.
+                unsafe {
+                    SendMessageW(self.list, WM_SETREDRAW, TRUE as WPARAM, 0);
+                    InvalidateRect(self.list, std::ptr::null(), TRUE);
+                }
                 self.set_status(&catalog_status(self.entries.len(), shown));
+                // Focus moves to the list once it holds rows: keyboard selection needs a row to
+                // land on, and focusing an empty list would only draw a focus rectangle.
+                // SAFETY: `list` is this window's live child control, on this thread.
+                unsafe {
+                    SetFocus(self.list);
+                }
             }
-            Err(error) => {
+            Err(reason) => {
                 self.entries.clear();
                 self.loaded = false;
-                self.set_status(&format!("Could not read the archive: {error}"));
+                self.set_status(&load_failure_status(&reason));
             }
         }
         self.sync_actions();
@@ -314,11 +413,7 @@ pub fn open_archive_window(request: &BrowseRequest) -> Result<(), Box<dyn std::e
         // exists while the loop has not started.
         let app = unsafe { &mut *state };
         app.test_close_while_busy = test_close_while_busy_requested();
-        app.load_catalog();
-        // SAFETY: focusing a live child of a live window.
-        unsafe {
-            SetFocus(app.list);
-        }
+        app.begin_load();
     }
 
     let accelerators = create_accelerators();
@@ -438,10 +533,20 @@ fn handle_message(window: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) ->
                 on_job_done(app);
                 return 0;
             }
+            job::WM_APP_LOAD_DONE => {
+                app.on_load_done(wparam);
+                return 0;
+            }
             WM_CLOSE => {
+                if app.cancellable() {
+                    // A running extraction stages its output and stops at the next chunk, so a
+                    // close request is the user's stop: it cancels and the window stays usable.
+                    cancel_job(app);
+                    return 0;
+                }
                 if app.busy {
-                    // The worker owns the destination until it commits or cleans up; letting the
-                    // window die here would abandon it and leave staging behind.
+                    // An integrity check cannot be preempted; letting the window die here would
+                    // throw its verdict away, so the request is refused and reported.
                     app.close_refused = true;
                     let mut text = CLOSE_WHILE_BUSY_MESSAGE.to_string();
                     if app.test_close_while_busy {
@@ -457,7 +562,9 @@ fn handle_message(window: HWND, message: u32, wparam: WPARAM, lparam: LPARAM) ->
                 let failed = join_worker(app);
                 // A worker that finished while the window was being torn down may have posted its
                 // notification after the outcome was taken; remove it instead of dispatching it.
-                discard_job_messages(window);
+                discard_notifications(window, job::WM_APP_JOB_DONE);
+                discard_notifications(window, job::WM_APP_LOAD_DONE);
+                release_load_worker(app);
                 // SAFETY: this window is going away, so no later dispatch may reach `App` through
                 // it, and the quit code is what `open_archive_window` reports.
                 unsafe {
@@ -608,6 +715,7 @@ fn create_menu() -> HMENU {
             (ID_EXTRACT_ALL, "Extract all"),
             (ID_EXTRACT_SELECTED, "Extract selected"),
             (ID_TEST, "Test integrity"),
+            (ID_CANCEL, "Cancel"),
         ] {
             let text = native::wide(label);
             AppendMenuW(popup, MF_STRING, id as usize, text.as_ptr());
@@ -621,7 +729,9 @@ fn create_menu() -> HMENU {
     }
 }
 
-/// Enter extracts everything and Esc closes, both routed through the menu command ids.
+/// Enter extracts everything, Esc is the close request, and both travel as menu command ids so a
+/// keyboard press and a menu pick take the same path — while an extraction runs, both become the
+/// cancellation.
 fn create_accelerators() -> HACCEL {
     let accelerators = [
         ACCEL {
@@ -644,6 +754,7 @@ fn on_command(app: &mut App, wparam: WPARAM) {
         ID_EXTRACT_ALL => begin_extract(app, false),
         ID_EXTRACT_SELECTED => begin_extract(app, true),
         ID_TEST => begin_test(app),
+        ID_CANCEL => cancel_job(app),
         ID_CLOSE => {
             // SAFETY: posting to this window asks the default procedure to close it; the busy
             // check lives in the WM_CLOSE handler, so every close route meets it.
@@ -845,20 +956,68 @@ fn join_worker(app: &mut App) -> bool {
     app.job_failed
 }
 
-/// Remove queued completion notifications for `window`.
-fn discard_job_messages(window: HWND) {
+/// Stop the running extraction, wait for it to discard its staging, and report the cancellation.
+///
+/// The wait is short by design: the producer checks the token before every member and on every
+/// copied chunk, so the join costs at most one chunk. Nothing is committed after the staging
+/// phase, which is why a cancelled job leaves the destination exactly as it found it. A job that
+/// finished before the request reached it is reported as what it actually did, never as cancelled.
+fn cancel_job(app: &mut App) {
+    let Some(worker) = app.job.as_ref() else {
+        return;
+    };
+    if !worker.cancellable() {
+        return;
+    }
+    worker.request_cancel();
+    let Some(worker) = app.job.take() else {
+        return;
+    };
+    let outcome = worker.finish();
+    app.busy = false;
+    app.close_refused = false;
+    match outcome {
+        Some(outcome) if outcome.cancelled() => {
+            // The user asked for this stop, so it is not a failure and the process still exits 0.
+            app.job_failed = false;
+            app.set_status(CANCELLED_STATUS);
+        }
+        Some(outcome) => {
+            app.job_failed = outcome.failed();
+            app.set_status(&describe(&outcome));
+        }
+        None => {
+            app.job_failed = true;
+            app.set_status(LOAD_WORKER_SILENT);
+        }
+    }
+    app.sync_actions();
+}
+
+/// Release the catalog worker when the window is being destroyed.
+///
+/// A load that already finished is joined and its entries dropped; one that is still reading is
+/// detached, because a catalog read has no cancellation seam and a window that the user closed
+/// must not wait for it. The worker owns only the archive path and its channel after this returns,
+/// and the notification it posts carries its generation id, which the window compares first.
+fn release_load_worker(app: &mut App) {
+    let Some(loader) = app.load_job.take() else {
+        return;
+    };
+    if loader.is_finished() {
+        let _ = loader.finish();
+    } else {
+        loader.detach();
+    }
+}
+
+/// Remove queued notifications of one kind for `window`.
+fn discard_notifications(window: HWND, notification: u32) {
     let mut message: MSG = unsafe { std::mem::zeroed() };
     loop {
         // SAFETY: `message` is writable and the filter selects only this job's notification.
-        let found = unsafe {
-            PeekMessageW(
-                &mut message,
-                window,
-                job::WM_APP_JOB_DONE,
-                job::WM_APP_JOB_DONE,
-                PM_REMOVE,
-            )
-        };
+        let found =
+            unsafe { PeekMessageW(&mut message, window, notification, notification, PM_REMOVE) };
         if found == 0 {
             break;
         }
@@ -898,8 +1057,14 @@ fn describe(outcome: &JobOutcome) -> String {
             display_target(target)
         ),
         JobResult::Tested { entries } => format!("Test passed: {entries} entries"),
+        JobResult::Cancelled => CANCELLED_STATUS.to_string(),
         JobResult::Failed(reason) => format!("{}: {reason}", outcome.kind.failure_label()),
     }
+}
+
+/// The status line a load failure leaves behind: the window stays open and every action stays off.
+fn load_failure_status(reason: &str) -> String {
+    format!("Could not read the archive: {reason}")
 }
 
 /// The extractor reports its canonicalised target; the `\\?\` prefix is Win32 plumbing that a
@@ -965,6 +1130,12 @@ mod tests {
             "a running worker owns the archive"
         );
         app.busy = false;
+        app.loading = true;
+        assert!(
+            !app.actions_available(),
+            "the catalog worker still owns the load"
+        );
+        app.loading = false;
         assert!(app.actions_available());
         app.loaded = false;
         assert!(
@@ -978,11 +1149,113 @@ mod tests {
         let mut app = App::new(PathBuf::from("이런-아카이브는-없다.zip"), None, 1 << 20);
         // The real failure path: the catalog cannot be read, so `loaded` stays false.
         app.busy = true;
-        app.load_catalog();
+        app.loading = true;
+        app.apply_catalog(Err("the archive is not a zip".to_string()));
         assert!(!app.loaded);
+        assert!(!app.loading, "a reported failure ends the load");
         // Exactly what `on_job_done` leaves behind for the refresh to recompute.
         app.busy = false;
         assert!(!app.actions_available());
+    }
+
+    #[test]
+    fn a_failed_load_reports_the_contract_text_and_keeps_the_window_usable() {
+        assert_eq!(
+            load_failure_status("not a zip"),
+            "Could not read the archive: not a zip"
+        );
+        assert!(
+            load_failure_status("x").starts_with("Could not read the archive: "),
+            "the failure contract keeps its prefix"
+        );
+        assert!(!CANCELLED_STATUS.is_empty());
+        assert_eq!(LOADING_STATUS, "Loading…");
+    }
+
+    /// The window thread's cancel path, end to end: a real extraction worker, the token, the join,
+    /// the discarded staging and the state the menu refresh reads afterwards.
+    #[test]
+    fn cancelling_an_extraction_frees_the_window_and_is_not_a_failure() {
+        use std::io::Write;
+
+        let dir = unique_temp_dir("cancel-path");
+        std::fs::create_dir_all(&dir).expect("create the fixture directory");
+        let archive = dir.join("fixture.zip");
+        let mut writer = zip::ZipWriter::new(std::fs::File::create(&archive).expect("create zip"));
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        let block = vec![0xA5u8; 1024 * 1024];
+        for index in 0..8 {
+            writer
+                .start_file(format!("chunk{index:02}.bin"), options)
+                .expect("start member");
+            writer.write_all(&block).expect("write member");
+        }
+        writer.finish().expect("finish zip");
+        let destination = dir.join("out");
+
+        let mut app = App::new(archive, None, 1 << 30);
+        app.loaded = true;
+        let request = JobRequest {
+            kind: JobKind::ExtractAll,
+            archive: app.archive.clone(),
+            password: None,
+            max_bytes: app.max_bytes,
+            destination: Some(destination.clone()),
+            members: Vec::new(),
+        };
+        app.job = Some(job::spawn(app.window, request).expect("spawn the worker"));
+        app.busy = true;
+        assert!(app.cancellable(), "an extraction can be stopped");
+        assert!(!app.actions_available());
+
+        cancel_job(&mut app);
+
+        assert!(!app.busy, "the window is usable again");
+        assert!(app.job.is_none(), "the worker was joined and released");
+        assert!(
+            !app.job_failed,
+            "the user's stop must not fail the process exit"
+        );
+        assert!(app.actions_available(), "the actions come back");
+        assert!(
+            !destination.exists() || std::fs::read_dir(&destination).unwrap().next().is_none(),
+            "nothing is committed after a cancel"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_job_that_cannot_be_cancelled_is_left_alone() {
+        let mut app = App::new(PathBuf::from("archive.zip"), None, 1 << 20);
+        app.loaded = true;
+        app.busy = true;
+        assert!(!app.cancellable(), "no job means nothing to cancel");
+        app.job = Some(
+            job::spawn(
+                app.window,
+                JobRequest {
+                    kind: JobKind::Test,
+                    archive: PathBuf::from("이런-아카이브는-없다.zip"),
+                    password: None,
+                    max_bytes: 1 << 20,
+                    destination: None,
+                    members: Vec::new(),
+                },
+            )
+            .expect("spawn the worker"),
+        );
+        assert!(
+            !app.cancellable(),
+            "an integrity check has no cancellation seam"
+        );
+        // The refusal path keeps the job; the caller reports it instead of stopping it.
+        cancel_job(&mut app);
+        assert!(
+            app.job.is_some(),
+            "a refused cancel leaves the worker alone"
+        );
+        app.job.take().expect("the job is still there").finish();
     }
 
     #[test]

@@ -1,12 +1,12 @@
 {
-  "version": "1.2.4",
+  "version": "1.2.5",
   "description": "Ad-free Windows archive CLI with JSON output for scripts and agents",
   "homepage": "https://github.com/ghdtjrtka/mothzip",
   "license": "MIT",
   "architecture": {
     "64bit": {
-      "url": "https://github.com/ghdtjrtka/mothzip/releases/download/v1.2.4/mothzip-1.2.4-windows-x64.zip",
-      "hash": "f6d52e17ac03983064257b8186fac020499474ed8912a68472d8b2a3ce4031ab"
+      "url": "https://github.com/ghdtjrtka/mothzip/releases/download/v1.2.5/mothzip-1.2.5-windows-x64.zip",
+      "hash": "21e0a90ab46637939b2da18a1b4d41e8d191ccbe1d9d253bdfde1d9dde9c5fc5"
     }
   },
   "bin": "mothzip.exe",

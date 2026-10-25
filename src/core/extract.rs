@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::fs::{self, File};
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use zip::result::ZipError;
@@ -49,6 +49,101 @@ impl Default for ExtractionOptions {
     }
 }
 
+/// One cancellation signal shared by the window thread and the extraction worker.
+///
+/// It wraps the archive reader's own token, so one [`CancellationToken::cancel`] reaches both the
+/// RAR extractor (which polls it internally) and the ZIP/TAR/7z loops in this file, which check it
+/// per member and per copied chunk. The signal is one-way: a cancelled token stays cancelled, and
+/// a fresh token is needed for the next job.
+#[derive(Clone, Debug, Default)]
+pub struct CancellationToken(rars::ReadCancellation);
+
+impl CancellationToken {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Ask the extraction to stop at its next checkpoint. Calling it again is harmless.
+    pub fn cancel(&self) {
+        self.0.cancel();
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.0.is_cancelled()
+    }
+}
+
+/// The one error a cancelled extraction returns, so a caller can tell a cancellation from a
+/// failure by kind instead of by message text.
+fn cancelled_error() -> io::Error {
+    io::Error::new(io::ErrorKind::Interrupted, "The extraction was cancelled")
+}
+
+/// The error a cancelled read stops with.
+///
+/// It must not be `Interrupted`: `io::copy` retries that kind by design, so the copy would spin on
+/// the same cancelled reader instead of stopping. The producer's boundary turns this error into
+/// [`cancelled_error`], so callers still see the documented `Interrupted` kind.
+fn cancelled_read_error() -> io::Error {
+    io::Error::other("The extraction was cancelled")
+}
+
+/// Stop before starting more work when the caller already cancelled.
+fn check_cancel(cancellation: Option<&CancellationToken>) -> io::Result<()> {
+    match cancellation {
+        Some(token) if token.is_cancelled() => Err(cancelled_error()),
+        _ => Ok(()),
+    }
+}
+
+/// A reader that observes the token on every chunk, so one large member can be abandoned
+/// mid-copy instead of only between members; `copy_archive_entry` keeps its byte accounting
+/// because the adapter only short-circuits the read.
+struct CancellableReader<'a, R: ?Sized> {
+    inner: &'a mut R,
+    cancellation: Option<&'a CancellationToken>,
+}
+
+impl<'a, R: Read + ?Sized> CancellableReader<'a, R> {
+    fn new(inner: &'a mut R, cancellation: Option<&'a CancellationToken>) -> Self {
+        Self {
+            inner,
+            cancellation,
+        }
+    }
+}
+
+impl<R: Read + ?Sized> Read for CancellableReader<'_, R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        match self.cancellation {
+            Some(token) if token.is_cancelled() => Err(cancelled_read_error()),
+            _ => self.inner.read(buffer),
+        }
+    }
+}
+
+/// A producer that failed after the user cancelled reports the cancellation, not whatever error
+/// surfaced at the abort point: the user stopped the job, so it is not a failure. Only the error
+/// path passes through here, so a run that completed is never rewritten as cancelled.
+fn cancellation_override(
+    error: Box<dyn std::error::Error>,
+    cancellation: Option<&CancellationToken>,
+) -> Box<dyn std::error::Error> {
+    match cancellation {
+        Some(token) if token.is_cancelled() => Box::new(cancelled_error()),
+        _ => error,
+    }
+}
+
+/// Undo one aborted staging run: the staging directory and, when this extraction created it, the
+/// destination directory disappear, so a failed or cancelled job leaves nothing visible behind.
+fn discard_staging(staging_dir: &Path, resolved_target: &Path, target_dir_existed_before: bool) {
+    let _ = fs::remove_dir_all(staging_dir);
+    if !target_dir_existed_before {
+        let _ = fs::remove_dir(resolved_target);
+    }
+}
+
 /// Last path component of a sanitized destination, used by flat extraction.
 fn leaf_component(path: &Path) -> io::Result<PathBuf> {
     path.file_name().map(PathBuf::from).ok_or_else(|| {
@@ -73,12 +168,16 @@ fn resolve_and_verify_target_dir(
     output_base: &Path,
     target_dir: &Path,
 ) -> Result<(PathBuf, bool), Box<dyn std::error::Error>> {
+    // Snapshot this before creating anything: the extraction removes the destination again on a
+    // cancelled or failed run, and it may only remove a directory it created itself. Taking the
+    // snapshot after `create_dir_all(output_base)` would report a directory this call made as
+    // pre-existing whenever the target is the base, and leave an empty folder behind.
+    let target_dir_existed_before = target_dir.exists();
     if !output_base.exists() {
         fs::create_dir_all(output_base)?;
     }
     let resolved_base = output_base.canonicalize()?;
 
-    let target_dir_existed_before = target_dir.exists();
     if target_dir_existed_before {
         if let Ok(meta) = fs::symlink_metadata(target_dir) {
             if meta.file_type().is_symlink() {
@@ -362,6 +461,23 @@ pub fn extract_archive_with_options(
     output_base: &Path,
     opts: &ExtractionOptions,
 ) -> Result<ExtractionSummary, Box<dyn std::error::Error>> {
+    extract_archive_with_options_and_cancel(archive_path, output_base, opts, None)
+}
+
+/// As [`extract_archive_with_options`], with a cooperative cancellation signal.
+///
+/// The token is observed before the first member, before each member and on every copied chunk,
+/// so a large member can be abandoned in the middle. The staged commit is the point of no return:
+/// a run that reaches it reports success even if the token was set meanwhile. A cancelled run
+/// returns an `Interrupted` error and leaves the destination as it found it — no committed file
+/// and no staging directory.
+pub fn extract_archive_with_options_and_cancel(
+    archive_path: &Path,
+    output_base: &Path,
+    opts: &ExtractionOptions,
+    cancellation: Option<&CancellationToken>,
+) -> Result<ExtractionSummary, Box<dyn std::error::Error>> {
+    check_cancel(cancellation)?;
     let format = detect_archive_format(archive_path)?;
 
     // Validate literal member selections against the raw catalog *before* any
@@ -378,20 +494,43 @@ pub fn extract_archive_with_options(
         Some(selection::SelectionSpec::build(&catalog, &opts.members)?)
     };
 
-    match format {
-        ArchiveFormat::Zip => extract_zip_archive(archive_path, output_base, opts, spec.as_ref()),
-        ArchiveFormat::Tar => {
-            extract_tar_archive(archive_path, output_base, None, opts, spec.as_ref())
+    check_cancel(cancellation)?;
+    let result = match format {
+        ArchiveFormat::Zip => {
+            extract_zip_archive(archive_path, output_base, opts, spec.as_ref(), cancellation)
         }
-        ArchiveFormat::TarStream(codec) => {
-            extract_tar_archive(archive_path, output_base, Some(codec), opts, spec.as_ref())
+        ArchiveFormat::Tar => extract_tar_archive(
+            archive_path,
+            output_base,
+            None,
+            opts,
+            spec.as_ref(),
+            cancellation,
+        ),
+        ArchiveFormat::TarStream(codec) => extract_tar_archive(
+            archive_path,
+            output_base,
+            Some(codec),
+            opts,
+            spec.as_ref(),
+            cancellation,
+        ),
+        ArchiveFormat::Stream(codec) => extract_stream_archive(
+            archive_path,
+            output_base,
+            codec,
+            opts,
+            spec.as_ref(),
+            cancellation,
+        ),
+        ArchiveFormat::SevenZ => {
+            extract_7z_archive(archive_path, output_base, opts, spec.as_ref(), cancellation)
         }
-        ArchiveFormat::Stream(codec) => {
-            extract_stream_archive(archive_path, output_base, codec, opts, spec.as_ref())
+        ArchiveFormat::Rar => {
+            extract_rar_archive(archive_path, output_base, opts, spec.as_ref(), cancellation)
         }
-        ArchiveFormat::SevenZ => extract_7z_archive(archive_path, output_base, opts, spec.as_ref()),
-        ArchiveFormat::Rar => extract_rar_archive(archive_path, output_base, opts, spec.as_ref()),
-    }
+    };
+    result.map_err(|error| cancellation_override(error, cancellation))
 }
 
 /// Extract a .7z archive using staged atomic transactions
@@ -400,6 +539,7 @@ fn extract_7z_archive(
     output_base: &Path,
     opts: &ExtractionOptions,
     spec: Option<&selection::SelectionSpec>,
+    cancellation: Option<&CancellationToken>,
 ) -> Result<ExtractionSummary, Box<dyn std::error::Error>> {
     let password = opts.password.as_deref();
     let max_bytes = opts.max_bytes;
@@ -466,6 +606,8 @@ fn extract_7z_archive(
 
         reader
             .for_each_entries(|entry, read_stream| {
+                check_cancel(cancellation)
+                    .map_err(|e| sevenz_rust2::Error::from(io::Error::other(e.to_string())))?;
                 let entry_name = entry.name().replace('\\', "/");
                 let norm_name = super::encoding::compose_hangul_nfc(&entry_name);
 
@@ -493,7 +635,7 @@ fn extract_7z_archive(
                     if !spec.matches(&entry_name) {
                         if entry.has_stream() {
                             super::guard::drain_archive_entry(
-                                read_stream,
+                                &mut CancellableReader::new(read_stream, cancellation),
                                 Some(entry.size()),
                                 max_bytes,
                             )
@@ -521,7 +663,7 @@ fn extract_7z_archive(
                     .map_err(|e| sevenz_rust2::Error::from(io::Error::other(e.to_string())))?;
 
                 let written = copy_archive_entry(
-                    read_stream,
+                    &mut CancellableReader::new(read_stream, cancellation),
                     &mut out_file,
                     Some(entry.size()),
                     extracted_bytes,
@@ -554,14 +696,12 @@ fn extract_7z_archive(
                 }
             })?;
 
+        check_cancel(cancellation)?;
         Ok(())
     })();
 
     if let Err(e) = stage_result {
-        let _ = fs::remove_dir_all(&staging_dir);
-        if !target_dir_existed_before {
-            let _ = fs::remove_dir(&resolved_target);
-        }
+        discard_staging(&staging_dir, &resolved_target, target_dir_existed_before);
         return Err(e);
     }
 
@@ -582,6 +722,7 @@ fn extract_rar_archive(
     output_base: &Path,
     opts: &ExtractionOptions,
     spec: Option<&selection::SelectionSpec>,
+    cancellation: Option<&CancellationToken>,
 ) -> Result<ExtractionSummary, Box<dyn std::error::Error>> {
     let password = opts.password.as_deref();
     let max_bytes = opts.max_bytes;
@@ -636,6 +777,10 @@ fn extract_rar_archive(
         if let Some(p) = password {
             options.password = Some(p.as_bytes());
         }
+        // The reader polls the same signal the ZIP/TAR/7z loops poll, so one Cancel reaches
+        // every format; rars returns its own `Cancelled` error, which the top-level
+        // `cancellation_override` reports as this file's canonical `Interrupted` error.
+        options.cancellation = cancellation.map(|token| &token.0);
         options.max_total_output_bytes = Some(max_bytes);
         options.max_member_output_bytes = Some(max_bytes);
         // A declared dictionary above the policy ceiling is refused before any output is opened.
@@ -862,14 +1007,12 @@ fn extract_rar_archive(
                 })?;
         }
 
+        check_cancel(cancellation)?;
         Ok(())
     })();
 
     if let Err(e) = stage_result {
-        let _ = fs::remove_dir_all(&staging_dir);
-        if !target_dir_existed_before {
-            let _ = fs::remove_dir(&resolved_target);
-        }
+        discard_staging(&staging_dir, &resolved_target, target_dir_existed_before);
         return Err(e);
     }
 
@@ -890,6 +1033,7 @@ fn extract_zip_archive(
     output_base: &Path,
     opts: &ExtractionOptions,
     spec: Option<&selection::SelectionSpec>,
+    cancellation: Option<&CancellationToken>,
 ) -> Result<ExtractionSummary, Box<dyn std::error::Error>> {
     let password = opts.password.as_deref();
     let smart = opts.smart;
@@ -934,6 +1078,7 @@ fn extract_zip_archive(
     let stage_result: Result<(), Box<dyn std::error::Error>> =
         (|| -> Result<(), Box<dyn std::error::Error>> {
             for i in 0..archive.len() {
+                check_cancel(cancellation)?;
                 let mut entry = match password {
                     Some(pass) => match archive.by_index_decrypt(i, pass.as_bytes()) {
                         Ok(e) => e,
@@ -1011,7 +1156,7 @@ fn extract_zip_archive(
 
                     let declared_size = entry.size();
                     let written = copy_archive_entry(
-                        &mut entry,
+                        &mut CancellableReader::new(&mut entry, cancellation),
                         &mut outfile,
                         Some(declared_size),
                         extracted_bytes,
@@ -1028,14 +1173,12 @@ fn extract_zip_archive(
                     });
                 }
             }
+            check_cancel(cancellation)?;
             Ok(())
         })();
 
     if let Err(e) = stage_result {
-        let _ = fs::remove_dir_all(&staging_dir);
-        if !target_dir_existed_before {
-            let _ = fs::remove_dir(&resolved_target);
-        }
+        discard_staging(&staging_dir, &resolved_target, target_dir_existed_before);
         return Err(e);
     }
 
@@ -1057,6 +1200,7 @@ fn extract_tar_archive(
     codec: Option<StreamCodec>,
     opts: &ExtractionOptions,
     spec: Option<&selection::SelectionSpec>,
+    cancellation: Option<&CancellationToken>,
 ) -> Result<ExtractionSummary, Box<dyn std::error::Error>> {
     let smart = opts.smart;
     let force_subfolder = opts.to_folder;
@@ -1108,6 +1252,7 @@ fn extract_tar_archive(
 
     let stage_result: Result<(), Box<dyn std::error::Error>> = (|| {
         for entry_res in tar.entries()? {
+            check_cancel(cancellation)?;
             let mut entry = entry_res?;
             let path_cow = entry.path()?;
             let raw_path = path_cow.to_string_lossy().replace('\\', "/");
@@ -1162,7 +1307,7 @@ fn extract_tar_archive(
 
                 let declared_size = entry.header().size()?;
                 let written = copy_archive_entry(
-                    &mut entry,
+                    &mut CancellableReader::new(&mut entry, cancellation),
                     &mut outfile,
                     Some(declared_size),
                     extracted_bytes,
@@ -1194,16 +1339,17 @@ fn extract_tar_archive(
         // (gzip CRC32/ISIZE, xz check, zstd content checksum when present) before we commit.
         let mut inner = tar.into_inner();
         let mut drain = io::sink();
-        io::copy(&mut inner, &mut drain)?;
+        io::copy(
+            &mut CancellableReader::new(&mut inner, cancellation),
+            &mut drain,
+        )?;
 
+        check_cancel(cancellation)?;
         Ok(())
     })();
 
     if let Err(e) = stage_result {
-        let _ = fs::remove_dir_all(&staging_dir);
-        if !target_dir_existed_before {
-            let _ = fs::remove_dir(&resolved_target);
-        }
+        discard_staging(&staging_dir, &resolved_target, target_dir_existed_before);
         return Err(e);
     }
 
@@ -1225,6 +1371,7 @@ fn extract_stream_archive(
     codec: StreamCodec,
     opts: &ExtractionOptions,
     spec: Option<&selection::SelectionSpec>,
+    cancellation: Option<&CancellationToken>,
 ) -> Result<ExtractionSummary, Box<dyn std::error::Error>> {
     let max_bytes = opts.max_bytes;
     let archive_stem = archive_stem_cleaned(archive_path);
@@ -1269,18 +1416,23 @@ fn extract_stream_archive(
     let mut reader = super::codec::decoder(File::open(archive_path)?, codec)?;
 
     let stage_result: Result<u64, Box<dyn std::error::Error>> = (|| {
+        check_cancel(cancellation)?;
         let mut outfile = File::create(&stage_file_path)?;
-        let written = copy_archive_entry(&mut reader, &mut outfile, None, 0, max_bytes)?;
+        let written = copy_archive_entry(
+            &mut CancellableReader::new(&mut reader, cancellation),
+            &mut outfile,
+            None,
+            0,
+            max_bytes,
+        )?;
+        check_cancel(cancellation)?;
         Ok(written)
     })();
 
     let extracted_bytes = match stage_result {
         Ok(b) => b,
         Err(e) => {
-            let _ = fs::remove_dir_all(&staging_dir);
-            if !target_dir_existed_before {
-                let _ = fs::remove_dir(&resolved_target);
-            }
+            discard_staging(&staging_dir, &resolved_target, target_dir_existed_before);
             return Err(e);
         }
     };
@@ -2009,5 +2161,185 @@ mod tests {
         assert_eq!(summary.extracted_files, payloads);
 
         let _ = fs::remove_dir_all(&out_dir);
+    }
+
+    /// The adapter, not the member boundary, is what makes a large member interruptible: every
+    /// read observes the token, so the very next chunk after a cancel fails.
+    #[test]
+    fn the_cancellable_reader_stops_on_the_next_chunk() {
+        let token = CancellationToken::new();
+        let mut source = io::repeat(0x11u8);
+        let mut buffer = [0u8; 16];
+        {
+            let mut reader = CancellableReader::new(&mut source, Some(&token));
+            assert_eq!(reader.read(&mut buffer).unwrap(), buffer.len());
+            token.cancel();
+            let error = reader
+                .read(&mut buffer)
+                .expect_err("a cancelled token stops the next chunk");
+            // `io::copy` retries `Interrupted` forever, so the read must not use that kind; the
+            // producer boundary reports the documented `Interrupted` instead.
+            assert_ne!(
+                error.kind(),
+                io::ErrorKind::Interrupted,
+                "a retryable kind would spin the copy loop instead of stopping it"
+            );
+            // The copy this adapter feeds really does stop: `io::copy` would loop on Interrupted,
+            // and it returns here after exactly one failed read.
+            let mut sink = io::sink();
+            let copied =
+                io::copy(&mut reader, &mut sink).expect_err("the cancelled reader stops the copy");
+            assert_ne!(copied.kind(), io::ErrorKind::Interrupted);
+        }
+        // Without a token the same reader keeps working: the ordinary path is unchanged.
+        let mut plain = CancellableReader::new(&mut source, None);
+        assert_eq!(plain.read(&mut buffer).unwrap(), buffer.len());
+    }
+
+    #[test]
+    fn a_cancelled_token_stops_a_zip_extraction_and_leaves_the_destination_empty() {
+        let temp_dir = PathBuf::from("target").join(format!(
+            "test_cancel_zip_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::create_dir_all(&temp_dir);
+
+        let archive = temp_dir.join("cancel.zip");
+        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+        let options =
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        for index in 0..4 {
+            writer
+                .start_file(format!("member{index}.bin"), options)
+                .unwrap();
+            std::io::Write::write_all(&mut writer, &vec![0x7Eu8; 512 * 1024]).unwrap();
+        }
+        fs::write(&archive, writer.finish().unwrap().into_inner()).unwrap();
+
+        let token = CancellationToken::new();
+        token.cancel();
+        let out_dir = temp_dir.join("out");
+        let error = extract_archive_with_options_and_cancel(
+            &archive,
+            &out_dir,
+            &ExtractionOptions::default(),
+            Some(&token),
+        )
+        .expect_err("a cancelled token stops the extraction");
+        assert_eq!(
+            error.downcast_ref::<io::Error>().map(|error| error.kind()),
+            Some(io::ErrorKind::Interrupted),
+            "a cancellation is reported as Interrupted, not as a failure message: {error}"
+        );
+        assert!(
+            !out_dir.exists(),
+            "a cancelled extraction must not leave the destination directory"
+        );
+
+        // The same archive extracts normally with an untouched token, so the cancel path did not
+        // change the producer's success path.
+        let good = CancellationToken::new();
+        let summary = extract_archive_with_options_and_cancel(
+            &archive,
+            &out_dir,
+            &ExtractionOptions::default(),
+            Some(&good),
+        )
+        .unwrap();
+        assert_eq!(summary.extracted_files, 4);
+        assert!(out_dir.join("member0.bin").is_file());
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn a_cancelled_token_stops_a_tar_extraction_and_removes_the_staging_directory() {
+        let temp_dir = PathBuf::from("target").join(format!(
+            "test_cancel_tar_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::create_dir_all(&temp_dir);
+
+        let archive = temp_dir.join("cancel.tar");
+        {
+            let mut builder = tar::Builder::new(File::create(&archive).unwrap());
+            for index in 0..3 {
+                let data = vec![0x2Au8; 256 * 1024];
+                let mut header = tar::Header::new_gnu();
+                header.set_size(data.len() as u64);
+                header.set_mode(0o644);
+                header.set_mtime(1_700_000_000);
+                header.set_cksum();
+                builder
+                    .append_data(&mut header, format!("t{index}.bin"), &data[..])
+                    .unwrap();
+            }
+            builder.finish().unwrap();
+        }
+
+        let token = CancellationToken::new();
+        token.cancel();
+        let out_dir = temp_dir.join("out");
+        let error = extract_archive_with_options_and_cancel(
+            &archive,
+            &out_dir,
+            &ExtractionOptions::default(),
+            Some(&token),
+        )
+        .expect_err("a cancelled token stops the extraction");
+        assert_eq!(
+            error.downcast_ref::<io::Error>().map(|error| error.kind()),
+            Some(io::ErrorKind::Interrupted)
+        );
+        assert!(!out_dir.exists(), "no destination directory is left behind");
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn a_cancelled_token_reaches_the_rar_reader_as_interrupted() {
+        let temp_dir = PathBuf::from("target").join(format!(
+            "test_cancel_rar_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::create_dir_all(&temp_dir);
+
+        let archive = temp_dir.join("cancel.rar");
+        let mut builder = rars::Builder::new(rars::ArchiveVersion::Rar50);
+        builder
+            .add_bytes(b"member.txt".to_vec(), b"payload".to_vec(), None, None)
+            .unwrap();
+        builder.write_to_path(&archive, None).unwrap();
+
+        let token = CancellationToken::new();
+        token.cancel();
+        let out_dir = temp_dir.join("out");
+        let error = extract_archive_with_options_and_cancel(
+            &archive,
+            &out_dir,
+            &ExtractionOptions::default(),
+            Some(&token),
+        )
+        .expect_err("a cancelled token stops the RAR extraction");
+        assert_eq!(
+            error.downcast_ref::<io::Error>().map(|error| error.kind()),
+            Some(io::ErrorKind::Interrupted),
+            "the reader's own Cancelled error is reported as this file's Interrupted: {error}"
+        );
+        assert!(!out_dir.exists());
+
+        let _ = fs::remove_dir_all(temp_dir);
     }
 }

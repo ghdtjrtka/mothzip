@@ -8,6 +8,21 @@ Topics are in `.github/repository-metadata.json`. Repository creation and public
 
 ## Release notes
 
+### 1.2.5
+
+- **The browsing window no longer freezes on a large archive.** The catalog is read on a worker
+  thread and the status line shows `Loading…` until it arrives; on a 30,000-entry archive the first
+  text used to take 13.5 s and a window round-trip during the load timed out ten times in a row. It
+  is now 60 ms, and a close request during the load is handled in 15-18 ms.
+- **A running extraction can be cancelled.** `Cancel` in the menu, Esc and the window's close
+  button cancel it; the status line reads `Cancelled`, nothing is left in the destination (no
+  files, no staging directory) and the process exits 0. Measured on a 96 MiB archive: cancelled
+  4.6 ms after the first staged file, and the window stayed usable.
+- Two defects found by measuring this: `io::copy` retries `Interrupted`, so a cancel used to spin
+  the worker at 100% CPU with the join blocked and staging left behind; and the destination
+  directory's existence was snapshotted after creating it, so a cancelled or failed job left an
+  empty output folder.
+
 ### 1.2.4
 
 - **A hostile RAR5 dictionary is refused instead of allocated.** The decoder allocates a window of

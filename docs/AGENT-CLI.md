@@ -1,6 +1,6 @@
 # Mothzip CLI contract for scripts, CI, and agents
 
-**Version 1.2.4** (Windows 10/11 x64, MIT). This page documents what a program can rely on when it drives `mothzip.exe`: the flags that exist, the JSON on each stream, how failure is signalled, and which integrity guarantees do **not** exist. It is a contract page, not a tutorial.
+**Version 1.2.5** (Windows 10/11 x64, MIT). This page documents what a program can rely on when it drives `mothzip.exe`: the flags that exist, the JSON on each stream, how failure is signalled, and which integrity guarantees do **not** exist. It is a contract page, not a tutorial.
 
 Every command line in sections 1–8 was executed against the shipped build on Windows before it was written; output blocks are real captures, not illustrations. Measured limits are marked **measured**; figures quoted from this repository's perf runs are marked as such, and the CLI additions at the end were run against the same build.
 
@@ -318,13 +318,17 @@ These features are in the shipped 1.2.x builds; the CLI examples below were run 
 
 | Menu entry | Command |
 | --- | --- |
-| `ZIP으로 압축 (&Mothzip)` | `mothzip pack-auto --format zip "%1"` |
-| `압축하기 (&Mothzip)` | a cascade of 13 formats: `ZIP (.zip)`, `7Z (.7z)`, `TAR (.tar)`, `TAR.GZ (.tar.gz)`, `TAR.ZST (.tar.zst)`, `TAR.XZ (.tar.xz)`, `TAR.LZ4 (.tar.lz4)`, `TAR.BR (.tar.br)`, `GZIP (.gz)`, `Zstandard (.zst)`, `XZ (.xz)`, `LZ4 (.lz4)`, `Brotli (.br)` |
-| `알아서 풀기 (&Mothzip)` (archives only) | `mothzip smart-unpack "%1" --open` |
+| `Compress to ZIP` | `mothzip pack-auto --format zip "%1"` |
+| `Compress to… (&M)` | a cascade of 13 formats: `ZIP (.zip)`, `7Z (.7z)`, `TAR (.tar)`, `TAR.GZ (.tar.gz)`, `TAR.ZST (.tar.zst)`, `TAR.XZ (.tar.xz)`, `TAR.LZ4 (.tar.lz4)`, `TAR.BR (.tar.br)`, `GZIP (.gz)`, `Zstandard (.zst)`, `XZ (.xz)`, `LZ4 (.lz4)`, `Brotli (.br)` |
+| `Extract automatically` (archives only) | `mothzip smart-unpack "%1" --open` |
 
-Archive extensions expose only the single extraction entry. The earlier `여기에 풀기` / `각각 폴더에 풀기` verbs are removed, and both install and uninstall delete the legacy `MothZip.UnpackHere` / `MothZip.UnpackFolder` keys, so an upgraded machine keeps only the current menu.
+Archive extensions expose only the single extraction entry. The earlier `Extract here` / `Extract each to its own folder` verbs are removed, and both install and uninstall delete the legacy `MothZip.UnpackHere` / `MothZip.UnpackFolder` keys, so an upgraded machine keeps only the current menu.
 
-**Double-click opens a list window.** `MothZip.Archive\shell\open` runs `mothzip open "%1"`. The window reads the central directory and lists entries without extracting anything: five columns (name, size, compressed size, modified time, encryption), with `압축 풀기` (all), `선택 풀기`, `검사`, and `닫기`. Enter extracts, Esc closes, and cancelling the destination-folder dialog does nothing. A corrupt or password-protected archive keeps the window open, reports the error in the status line, and disables the actions. `open` is rejected in headless runs — measured: `mothzip open out.zip --non-interactive` exits 1 with `The browsing window is unavailable with --non-interactive; use peek, cat, or unpack`.
+**Double-click opens a list window.** `MothZip.Archive\shell\open` runs `mothzip open "%1"`. The window reads the central directory and lists entries without extracting anything: five columns (`Name`, `Size`, `Packed`, `Modified`, `Encrypted`), with `Extract all`, `Extract selected`, `Test integrity` and `Close`. Enter extracts, Esc closes, and cancelling the destination-folder dialog does nothing. A corrupt or password-protected archive keeps the window open, reports the error in the status line (`Could not read the archive: …`) and disables the actions. `open` is rejected in headless runs — measured: `mothzip open out.zip --non-interactive` exits 1 with `The browsing window is unavailable with --non-interactive; use peek, cat, or unpack`.
+
+**A large archive loads without freezing the window.** The catalog is read on a worker thread; the status line shows `Loading…` until the list arrives, and the actions stay disabled meanwhile. Measured on a 30,000-entry archive: the first status text appeared after 60 ms (13,508 ms when the load blocked the UI thread), a synchronous window round-trip during the load took 0.26 ms, and a close request was handled in 15-18 ms.
+
+**Closing a running job cancels it.** `Cancel` in the menu (enabled only while an extraction runs), Esc, and the window's close button all cancel; the status line reads `Cancelled`, the destination keeps no files and no `.mothzip_stage_*` directory, and the process exits 0. Measured on a 96 MiB stored archive: cancelled 4.6 ms after the first staged file, zero files and zero staging directories left, window still usable afterwards. Cancellation applies to extraction; integrity checking keeps the older behaviour of refusing to close until it finishes.
 
 **`pack --format <fmt>` forces the container.** Accepted values are `zip`, `7z`, `tar`, `tar.gz`, `tar.zst`, `tar.xz`, `tar.lz4`, `tar.br`, `gz`, `zst`, `xz`, `lz4`, and `br`; without it the output suffix still decides. Measured: `mothzip pack forced.7z src --format zip` wrote a ZIP under the `.7z` name (`archive_path` reported `forced.7z`).
 
