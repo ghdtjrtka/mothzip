@@ -1,12 +1,12 @@
 # MothZip CLI contract for scripts, CI, and agents
 
-**Version 1.2.0** (Windows 10/11 x64, MIT). This page documents what a program can rely on when it drives `mothzip.exe`: the flags that exist, the JSON on each stream, how failure is signalled, and which integrity guarantees do **not** exist. It is a contract page, not a tutorial.
+**Version 1.2.1** (Windows 10/11 x64, MIT). This page documents what a program can rely on when it drives `mothzip.exe`: the flags that exist, the JSON on each stream, how failure is signalled, and which integrity guarantees do **not** exist. It is a contract page, not a tutorial.
 
-Every command line in sections 1–8 was executed against the shipped 1.2.0 build on Windows before it was written; output blocks are real captures, not illustrations. Measured limits are marked **measured**; figures quoted from this repository's perf runs are marked as such, and the CLI additions at the end were run against the same build.
+Every command line in sections 1–8 was executed against the shipped build on Windows before it was written; output blocks are real captures, not illustrations. Measured limits are marked **measured**; figures quoted from this repository's perf runs are marked as such, and the CLI additions at the end were run against the same build.
 
 ## 1. Install and place the binary
 
-Run `Install.cmd` from the release ZIP, or the `install` subcommand, to install per user at `%LOCALAPPDATA%\Programs\MothZip` with PATH, Explorer actions, and a Start Menu shortcut; for CI, portable use is simpler — copy `mothzip.exe` to a directory you control and invoke it by absolute path. There is no account, no background service, no network access, and no bundled or external archiver process, so a pinned copy is a self-contained step. `mothzip.exe --version` prints `mothzip 1.2.0`, and `mothzip status --json` reports install state, paths, and version for inventory scripts. Open a new terminal after a PATH-changing install.
+Run `Install.cmd` from the release ZIP, or the `install` subcommand, to install per user at `%LOCALAPPDATA%\Programs\MothZip` with PATH, Explorer actions, and a Start Menu shortcut; for CI, portable use is simpler — copy `mothzip.exe` to a directory you control and invoke it by absolute path. There is no account, no background service, no network access, and no bundled or external archiver process, so a pinned copy is a self-contained step. `mothzip.exe --version` prints `mothzip 1.2.1`, and `mothzip status --json` reports install state, paths, and version for inventory scripts. Open a new terminal after a PATH-changing install.
 
 ## 2. Command and flag contract
 
@@ -307,9 +307,9 @@ The guarantees above were validated by the repository's audit runs, which an int
 
 The same build passed `cargo test --locked` (88 unit tests), `cargo clippy --locked --all-targets -- -D warnings` (0 warnings), and `cargo fmt --check` (clean).
 
-## 10. New in 1.2.0
+## 10. New in 1.2.x
 
-These features are in the shipped 1.2.0 build; the CLI examples below were run against it. The contracts above already include them, so this section is the release-level summary.
+These features are in the shipped 1.2.x builds; the CLI examples below were run against them. The contracts above already include them, so this section is the release-level summary.
 
 **Explorer menus in exactly three groups.** The right-click menu on files and folders is now:
 

@@ -96,9 +96,15 @@ unsafe fn try_decode_codepage(codepage: u32, raw_bytes: &[u8]) -> Option<String>
 
 /// Decode raw entry name bytes.
 /// 1. UTF-8 first (Modern standard, with Hangul NFD->NFC composition).
-/// 2. System ANSI code page (CP_ACP: CP949 on Korean Windows, CP932 on Japanese, CP1252 on US/EU).
-/// 3. CP949 fallback (in case a non-Korean machine opens a Korean ALZip archive).
+/// 2. Korean CP949 (the legacy code page Korean archivers wrote before UTF-8 names).
+/// 3. System ANSI code page (CP_ACP: CP949 on Korean Windows, CP932 on Japanese, CP1252 on US/EU).
 /// 4. Lossy UTF-8 fallback.
+///
+/// Order matters: CP_ACP would accept any byte pair on a Western machine and turn a Korean name
+/// into mojibake before CP949 is ever tried. CP949 is strict (`MB_ERR_INVALID_CHARS`), so Latin
+/// text such as `Café.txt` fails it and still decodes through CP_ACP. The trade-off is deliberate:
+/// this is a Korean-first tool, so a legacy Japanese CP932 name whose bytes happen to form valid
+/// CP949 pairs decodes as Hangul instead of Japanese.
 pub fn decode_entry_name(raw_bytes: &[u8]) -> String {
     compose_hangul_nfc(&decode_entry_name_raw(raw_bytes))
 }
@@ -112,13 +118,14 @@ pub fn decode_entry_name_raw(raw_bytes: &[u8]) -> String {
 
     if !raw_bytes.is_empty() {
         unsafe {
-            // 2. Try the current Windows system ANSI code page
-            if let Some(decoded) = try_decode_codepage(CP_ACP, raw_bytes) {
+            // 2. Try Korean CP949 first: the host code page must not decide what a Korean archive
+            //    means (see the order note above).
+            if let Some(decoded) = try_decode_codepage(CP949, raw_bytes) {
                 return decoded;
             }
 
-            // 3. Try Korean CP949 (if system ANSI code page was not 949)
-            if let Some(decoded) = try_decode_codepage(CP949, raw_bytes) {
+            // 3. Fall back to the machine's own legacy code page
+            if let Some(decoded) = try_decode_codepage(CP_ACP, raw_bytes) {
                 return decoded;
             }
         }

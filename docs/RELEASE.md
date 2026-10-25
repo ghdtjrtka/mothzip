@@ -8,6 +8,15 @@ Topics are in `.github/repository-metadata.json`. Repository creation and public
 
 ## Release notes
 
+### 1.2.1
+
+- Fix legacy Korean (CP949) member names decoding through the host ANSI code page first. On a
+  Windows installation whose ANSI code page is not 949, a Korean ZIP or 7z name written before
+  UTF-8 names were common decoded as mojibake; CP949 is now tried before the host code page. Latin
+  text still decodes correctly because CP949 rejects it.
+- Add the continuous integration workflow that runs formatting, clippy, unit tests and the release
+  audit gate on every push.
+
 ### 1.2.0
 
 - `pack --7z-dict <MiB>` sets the LZMA2 dictionary, which is what 7z creation memory is proportional to: on a 60 MB input the peak fell from 85.1 MiB to 47.1 MiB at 4 MiB (+0.02% size) and 28.1 MiB at 2 MiB (+0.30%).
