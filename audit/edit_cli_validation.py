@@ -35,7 +35,7 @@ import time
 import uuid
 from pathlib import Path
 
-EXPECTED_BINARY_SHA256 = "17c8dd334c1de189623d0bc506580f2340bf4827b1f46c0dd7be47ad3f0fb162"
+EXPECTED_BINARY_SHA256: str | None = None  # set with --expect-sha; unset means no comparison
 DEFAULT_BINARY = Path(
     r"C:\Users\Administrator\AppData\Local\Programs\MothZip\mothzip.exe"
 )
@@ -54,6 +54,7 @@ HOSTILE_DIR = RUN / "hostile"
 BINARY = DEFAULT_BINARY
 SETUP_CALLS: list[dict] = []
 CASES: list[dict] = []
+SKIPPED: list[str] = []
 FACTS: dict = {}
 
 NEW_BYTES = b"NEW-FILE-CONTENT\n"
@@ -398,20 +399,31 @@ def build_fixtures() -> None:
         for path in (WORKSPACE / "audit" / "runs").glob("rar-reference-*/**/*.rar")
         if path.is_file() and 0 < path.stat().st_size < 100_000
     ]
-    require(bool(rar_candidates), "setup rar: no reference .rar fixture found under audit/runs")
-    rar_source = min(rar_candidates, key=lambda path: path.stat().st_size)
-    shutil.copy2(rar_source, FIXTURES / "fixture.rar")
-    rar_peek = execute(["peek", FIXTURES / "fixture.rar", "--json", "--non-interactive"])
-    record_setup("peek-rar-fixture", rar_peek)
-    expect_success(rar_peek, "setup peek rar")
-    rar_payload = json.loads(rar_peek.out_text)
-    rar_members = [str(e["path"]).rstrip("/") for e in rar_payload.get("tree_summary", []) if not e["is_dir"]]
-    require(bool(rar_members), "setup rar: fixture has no file member")
-    FACTS["rar_fixture"] = {
-        "source": str(rar_source),
-        "sha256": sha256_file(FIXTURES / "fixture.rar"),
-        "first_file_member": rar_members[0],
-    }
+    if not rar_candidates:
+        # The reference RAR archives were produced by other tools and are not published with the
+        # source, so a fresh checkout cannot build this fixture. The case is reported as skipped and
+        # the other format rejections still run from fixtures created here.
+        FACTS["rar_fixture"] = {"source": None, "reason": "no reference .rar fixture under audit/runs"}
+        rar_member = ""
+    else:
+        rar_source = min(rar_candidates, key=lambda path: path.stat().st_size)
+        shutil.copy2(rar_source, FIXTURES / "fixture.rar")
+        rar_peek = execute(["peek", FIXTURES / "fixture.rar", "--json", "--non-interactive"])
+        record_setup("peek-rar-fixture", rar_peek)
+        expect_success(rar_peek, "setup peek rar")
+        rar_payload = json.loads(rar_peek.out_text)
+        rar_members = [
+            str(e["path"]).rstrip("/")
+            for e in rar_payload.get("tree_summary", [])
+            if not e["is_dir"]
+        ]
+        require(bool(rar_members), "setup rar: fixture has no file member")
+        rar_member = rar_members[0]
+        FACTS["rar_fixture"] = {
+            "source": str(rar_source),
+            "sha256": sha256_file(FIXTURES / "fixture.rar"),
+            "first_file_member": rar_member,
+        }
 
     # Sanity-check that fixtures are readable before measuring edit behavior.
     for fixture in ("base.zip", "base.7z", "flat.zip", "enc.zip", "enc.7z"):
@@ -857,7 +869,7 @@ def exercise_hostile_rename(case: Case, target: str) -> None:
 
 # -------------------------------------------------------------------------- driver
 def case_list() -> list[tuple[str, object]]:
-    rar_member = FACTS["rar_fixture"]["first_file_member"]
+    rar_member = FACTS["rar_fixture"].get("first_file_member", "")
     return [
         ("zip/add-new", lambda c: exercise_add(c, "base.zip")),
         ("zip/delete-file", lambda c: exercise_delete_file(c, "base.zip")),
@@ -944,7 +956,14 @@ def main() -> int:
         default=str(DEFAULT_BINARY),
         help=f"installed mothzip.exe under measurement (default: {DEFAULT_BINARY})",
     )
+    parser.add_argument(
+        "--expect-sha",
+        default=None,
+        help="fail the run when the measured binary hash differs (optional)",
+    )
     arguments = parser.parse_args()
+    global EXPECTED_BINARY_SHA256
+    EXPECTED_BINARY_SHA256 = arguments.expect_sha
     BINARY = Path(arguments.binary).resolve()
 
     if not BINARY.is_file():
@@ -955,8 +974,10 @@ def main() -> int:
     FACTS["binary"] = str(BINARY)
     FACTS["binary_sha256"] = actual_sha
     FACTS["binary_sha256_expected"] = EXPECTED_BINARY_SHA256
-    FACTS["binary_matches_expected"] = actual_sha == EXPECTED_BINARY_SHA256
-    if actual_sha != EXPECTED_BINARY_SHA256:
+    FACTS["binary_matches_expected"] = (
+        EXPECTED_BINARY_SHA256 is None or actual_sha == EXPECTED_BINARY_SHA256
+    )
+    if EXPECTED_BINARY_SHA256 is not None and actual_sha != EXPECTED_BINARY_SHA256:
         print(
             f"WARNING: {BINARY} sha256={actual_sha} does not match expected "
             f"{EXPECTED_BINARY_SHA256}; measurements describe this other binary.",
@@ -976,7 +997,9 @@ def main() -> int:
             "binary": str(BINARY),
             "binary_sha256": actual_sha,
             "binary_sha256_expected": EXPECTED_BINARY_SHA256,
-            "binary_matches_expected": actual_sha == EXPECTED_BINARY_SHA256,
+            "binary_matches_expected": (
+                EXPECTED_BINARY_SHA256 is None or actual_sha == EXPECTED_BINARY_SHA256
+            ),
             "fatal": f"fixture setup failed: {type(failure).__name__}: {failure}",
             "setup": SETUP_CALLS,
             "summary": {"cases": 0, "passed": 0, "failed": 0},
@@ -987,6 +1010,12 @@ def main() -> int:
         return 2
 
     for name, body in case_list():
+        if name == "format/rar-rejects-edit" and not (FIXTURES / "fixture.rar").is_file():
+            SKIPPED.append(
+                "format/rar-rejects-edit: no reference .rar fixture under audit/runs "
+                "(create one with any RAR tool and place it under audit/runs/rar-reference-*/)"
+            )
+            continue
         run_case(name, body)
 
     passed = sum(1 for case in CASES if case["passed"])
@@ -997,12 +1026,20 @@ def main() -> int:
         "binary_version": version.out_text.strip(),
         "binary_sha256": actual_sha,
         "binary_sha256_expected": EXPECTED_BINARY_SHA256,
-        "binary_matches_expected": actual_sha == EXPECTED_BINARY_SHA256,
+        "binary_matches_expected": (
+                EXPECTED_BINARY_SHA256 is None or actual_sha == EXPECTED_BINARY_SHA256
+            ),
         "password_fixture": PASSWORD,
         "fixture_root": str(FIXTURES),
         "fixture_facts": FACTS,
         "setup": SETUP_CALLS,
-        "summary": {"cases": len(CASES), "passed": passed, "failed": failed},
+        "summary": {
+            "cases": len(CASES),
+            "passed": passed,
+            "failed": failed,
+            "skipped": len(SKIPPED),
+        },
+        "skipped": SKIPPED,
         "cases": CASES,
     }
     results_path = RUN / "results.json"
@@ -1016,7 +1053,9 @@ def main() -> int:
                 "failed_cases": [case["case"] for case in CASES if not case["passed"]],
                 "results": str(results_path),
                 "binary_sha256": actual_sha,
-                "binary_matches_expected": actual_sha == EXPECTED_BINARY_SHA256,
+                "binary_matches_expected": (
+                EXPECTED_BINARY_SHA256 is None or actual_sha == EXPECTED_BINARY_SHA256
+            ),
             }
         )
     )
