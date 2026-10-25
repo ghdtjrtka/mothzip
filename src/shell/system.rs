@@ -190,6 +190,18 @@ pub fn create_script(script_body: &str) -> Result<PathBuf, ShellError> {
     );
     let temp_script = temp_script_path(&script_id);
 
+    // The directory belongs to whoever writes the script. Creating it here keeps a clean checkout
+    // working: the test build writes under `target/shell_tmp`, which exists only after the first
+    // script, so a fresh checkout used to fail every test that needed one.
+    if let Some(parent) = temp_script.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!("create script directory {}: {error}", parent.display()),
+            )
+        })?;
+    }
+
     let full_script = inject_script_preamble(script_body);
     write_temp_script(&temp_script, &full_script)?;
 
@@ -235,9 +247,7 @@ mod tests {
     use super::*;
 
     fn per_test_script_dir() -> PathBuf {
-        let dir = Path::new("target").join("shell_tmp");
-        let _ = fs::create_dir_all(&dir);
-        dir
+        Path::new("target").join("shell_tmp")
     }
 
     #[test]
