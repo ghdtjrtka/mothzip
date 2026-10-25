@@ -7,6 +7,7 @@ use walkdir::WalkDir;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
+use super::format::civil_from_days;
 use super::format::ArchiveFormat;
 
 /// RAR creation is out of scope for every writer; one message keeps the entry points honest.
@@ -99,6 +100,16 @@ fn validate_level(
     if let Some(codec) = format.codec() {
         super::codec::validated_level(codec, level)
             .map_err(|error| format!("{}: {}", format.name(), error))?;
+        return Ok(());
+    }
+    // ZIP and 7z take a 0..=9 level. 7z used to clamp anything above 9 without saying so, and ZIP
+    // only failed after the staging file existed, with the encoder's own message.
+    if matches!(format, ArchiveFormat::Zip | ArchiveFormat::SevenZ) {
+        if let Some(level) = level {
+            if level > 9 {
+                return Err(format!("{} compression level must be 0..=9", format.name()).into());
+            }
+        }
     }
     Ok(())
 }
@@ -121,32 +132,6 @@ fn parse_epoch_seconds(text: &str) -> Result<u64, String> {
     text.trim().parse::<u64>().map_err(|_| {
         format!("SOURCE_DATE_EPOCH must be whole seconds since 1970-01-01, got '{text}'")
     })
-}
-
-/// Civil date of a count of days since 1970-01-01 (Howard Hinnant's `civil_from_days`).
-///
-/// `format.rs` has the same arithmetic, but its copy is private and its public Windows entry point
-/// converts through the local time zone, which is the one thing a fixed timestamp must not do.
-fn civil_from_days(days: i64) -> (i64, u8, u8) {
-    let shifted = days + 719_468;
-    let era = if shifted >= 0 {
-        shifted
-    } else {
-        shifted - 146_096
-    } / 146_097;
-    let day_of_era = (shifted - era * 146_097) as u64; // [0, 146096]
-    let year_of_era =
-        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
-    let year = year_of_era as i64 + era * 400;
-    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-    let month_index = (5 * day_of_year + 2) / 153;
-    let day = (day_of_year - (153 * month_index + 2) / 5 + 1) as u8;
-    let month = if month_index < 10 {
-        month_index + 3
-    } else {
-        month_index - 9
-    } as u8;
-    (if month <= 2 { year + 1 } else { year }, month, day)
 }
 
 /// The DOS date/time a reproducible ZIP records for the fixed instant.
@@ -259,6 +244,19 @@ fn resolves_into_excluded(
     }
 }
 
+/// Drop trailing separators without changing what the path refers to.
+///
+/// `C:\` has to stay `C:\`: trimming it produces `C:`, which Windows reads as "the current
+/// directory on drive C" — a different tree that would be packed silently instead of the drive.
+fn without_trailing_separators(path: &Path) -> PathBuf {
+    let text = path.to_string_lossy();
+    let trimmed = text.trim_end_matches(['/', '\\']);
+    if trimmed.is_empty() || trimmed.ends_with(':') {
+        return path.to_path_buf();
+    }
+    PathBuf::from(trimmed)
+}
+
 /// The single producer of an archive member inventory from source filesystem paths.
 ///
 /// A file source contributes its file name; a directory source contributes itself and its whole
@@ -288,13 +286,8 @@ pub(crate) fn collect_source_tree(
     let mut seen_entries = HashSet::new();
 
     for source in sources {
-        let source_str = source.to_string_lossy();
-        let trimmed_str = source_str.trim_end_matches(['/', '\\']);
-        let clean_source = if trimmed_str.is_empty() {
-            source.as_path()
-        } else {
-            Path::new(trimmed_str)
-        };
+        let clean_source = without_trailing_separators(source);
+        let clean_source = clean_source.as_path();
 
         let meta = clean_source
             .symlink_metadata()
@@ -931,7 +924,7 @@ fn write_zip_archive<W: Write>(
 /// compression/ratio parameter: `Lzma2Options::from_level` resolves it through `lzma_rust2`'s
 /// `PRESET_TO_DICT_SIZE` (8 MiB at the default level 5), and every dictionary byte costs the match
 /// finder about eleven bytes of state (see the 7z row of the pack-output handoff).
-fn seven_z_methods(
+pub(crate) fn seven_z_encoder_chain(
     level: u32,
     password: Option<&str>,
     dictionary_bytes: Option<u32>,
@@ -972,7 +965,7 @@ fn write_7z_archive(
     let level = options.level.unwrap_or(5).clamp(0, 9);
     // Set once, before the first entry: the same chain also decides whether the 7z header itself
     // is encrypted, so it must be in place before `finish` encodes that header.
-    writer.set_content_methods(seven_z_methods(
+    writer.set_content_methods(seven_z_encoder_chain(
         level,
         options.password,
         plan.seven_z_dictionary_bytes,
@@ -1195,6 +1188,58 @@ mod tests {
 
     /// A pipe has no member metadata, so `--from-stdin` must compress exactly the bytes it reads
     /// and hand them back through the same single-stream decoder.
+    /// `C:\` must not lose its separator: `C:` is the current directory on that drive, so the
+    /// pack would silently archive a different tree than the one the caller named.
+    #[test]
+    fn test_trailing_separator_keeps_a_drive_root_absolute() {
+        let drive_root = without_trailing_separators(Path::new("C:\\"));
+        assert_eq!(drive_root, Path::new("C:\\"));
+        assert!(
+            drive_root.is_absolute(),
+            "a drive root must stay absolute, got {drive_root:?}"
+        );
+        assert_eq!(
+            without_trailing_separators(Path::new("C:\\Users\\me\\")),
+            Path::new("C:\\Users\\me")
+        );
+        assert_eq!(
+            without_trailing_separators(Path::new("/")),
+            Path::new("/"),
+            "a bare separator is still the root"
+        );
+    }
+
+    /// ZIP and 7z accept 0..=9 only. 7z used to clamp anything higher without saying so, and ZIP
+    /// failed after its staging file already existed.
+    #[test]
+    fn test_archive_level_range_is_checked_before_staging() {
+        for format in [ArchiveFormat::Zip, ArchiveFormat::SevenZ] {
+            assert!(validate_level(format, Some(0)).is_ok());
+            assert!(validate_level(format, Some(9)).is_ok());
+            for level in [10, 15, 22] {
+                let error = validate_level(format, Some(level))
+                    .expect_err("out-of-range archive level must be refused");
+                assert!(
+                    error.to_string().contains("0..=9"),
+                    "{} level {level} message was {error}",
+                    format.name()
+                );
+            }
+        }
+        // TAR carries no level of its own; a codec container is validated against its codec.
+        assert!(validate_level(ArchiveFormat::Tar, Some(5)).is_ok());
+        assert!(validate_level(
+            ArchiveFormat::TarStream(super::super::codec::StreamCodec::Gzip),
+            Some(9)
+        )
+        .is_ok());
+        assert!(validate_level(
+            ArchiveFormat::TarStream(super::super::codec::StreamCodec::Gzip),
+            Some(10)
+        )
+        .is_err());
+    }
+
     #[test]
     fn test_stream_from_reader_roundtrips_through_the_codec() {
         let payload = b"stdin payload with no member name\n".repeat(64);

@@ -11,6 +11,72 @@ use super::format::{
 };
 use super::smart::LayoutEntryInfo;
 
+/// One member name in the form every comparison uses: `/` separators, no surrounding slashes.
+///
+/// Archive names keep their raw bytes as identity; this is only the text two names are compared in.
+pub(crate) fn member_form(name: &str) -> String {
+    name.replace('\\', "/").trim_matches('/').to_string()
+}
+
+/// Rank of one member name against a request: `0` exact, `1` Hangul-composed equal, `2` ASCII
+/// case-insensitive equal. `None` means the request does not name that member.
+///
+/// `peek` displays composed names and `cat` resolves a request by the most exact rank, so
+/// `delete`, `rename` and `--member` answer the same question with the same ranks here instead
+/// of comparing raw bytes on their own. There is no stage above these three: no similarity, no
+/// fuzzy match, and no Unicode case folding that could change a path.
+pub(crate) fn member_match_rank(requested: &str, candidate: &str) -> Option<u8> {
+    let requested = member_form(requested);
+    let candidate = member_form(candidate);
+    if requested == candidate {
+        return Some(0);
+    }
+    let requested = compose_hangul_nfc(&requested);
+    let candidate = compose_hangul_nfc(&candidate);
+    if requested == candidate {
+        return Some(1);
+    }
+    candidate.eq_ignore_ascii_case(&requested).then_some(2)
+}
+
+/// The single member-identity test, as the yes/no answer of the rank rule.
+pub(crate) fn member_matches(requested: &str, candidate: &str) -> bool {
+    member_match_rank(requested, candidate).is_some()
+}
+
+/// The suffix of `candidate` that follows the selected `requested` prefix, or `None` when the
+/// member is not selected. `Some("")` is the member itself; a subtree yields `Some("/rest")`.
+///
+/// Selection is identity plus descent at a `/` boundary: both names are split into components and
+/// each component pair is decided by `member_match_rank`, so a delete, a rename or a `--member`
+/// literal names one member or a whole directory without a second name rule.
+pub(crate) fn member_subtree_suffix(requested: &str, candidate: &str) -> Option<String> {
+    if member_matches(requested, candidate) {
+        return Some(String::new());
+    }
+    let requested = member_form(requested);
+    let candidate = member_form(candidate);
+    if requested.is_empty() {
+        return None;
+    }
+    let requested_parts: Vec<&str> = requested.split('/').collect();
+    let candidate_parts: Vec<&str> = candidate.split('/').collect();
+    if candidate_parts.len() < requested_parts.len()
+        || !requested_parts
+            .iter()
+            .zip(&candidate_parts)
+            .all(|(want, have)| member_match_rank(want, have).is_some())
+    {
+        return None;
+    }
+    let rest = &candidate_parts[requested_parts.len()..];
+    Some(if rest.is_empty() {
+        String::new()
+    } else {
+        format!("/{}", rest.join("/"))
+    })
+}
+
 /// Uniform archive entry metadata across all supported archive formats.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CatalogEntry {
@@ -308,4 +374,70 @@ fn read_rar_catalog(
     }
 
     Ok(entries)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{member_form, member_match_rank, member_matches, member_subtree_suffix};
+
+    /// The same name in Hangul syllables and in conjoining jamo, as macOS and Linux write it.
+    const COMPOSED: &str = "\u{d55c}\u{ae00}.txt";
+    const DECOMPOSED: &str = "\u{1112}\u{1161}\u{11ab}\u{1100}\u{1173}\u{11af}.txt";
+
+    #[test]
+    fn member_rank_answers_exact_then_composed_then_case() {
+        assert_eq!(member_match_rank("notes.txt", "notes.txt"), Some(0));
+        assert_eq!(member_match_rank(COMPOSED, DECOMPOSED), Some(1));
+        assert_eq!(member_match_rank(DECOMPOSED, COMPOSED), Some(1));
+        assert_eq!(member_match_rank("notes.txt", "NOTES.TXT"), Some(2));
+    }
+
+    #[test]
+    fn member_identity_answers_exact_composed_and_case_in_the_cat_order() {
+        assert!(member_matches("notes.txt", "notes.txt"));
+        assert!(member_matches(COMPOSED, DECOMPOSED));
+        assert!(member_matches(DECOMPOSED, COMPOSED));
+        assert!(member_matches("notes.txt", "NOTES.TXT"));
+        assert!(member_matches("dir/notes.txt", "dir\\notes.txt"));
+        assert!(member_matches("/notes.txt", "notes.txt"));
+    }
+
+    #[test]
+    fn member_identity_rejects_unrelated_names() {
+        assert!(!member_matches(COMPOSED, "\u{b2e4}\u{b978}.txt"));
+        assert!(!member_matches(COMPOSED, "notes.txt"));
+        assert!(!member_matches("notes.txt", "notes.md"));
+        assert!(!member_matches("notes.txt", "notes.txt.bak"));
+        assert_eq!(member_match_rank(COMPOSED, "\u{b2e4}\u{b978}.txt"), None);
+    }
+
+    #[test]
+    fn member_selection_descends_only_at_a_slash_boundary() {
+        assert_eq!(member_subtree_suffix("dir", "dir"), Some(String::new()));
+        assert_eq!(
+            member_subtree_suffix("dir", "dir/sub/f.txt"),
+            Some("/sub/f.txt".into())
+        );
+        assert_eq!(
+            member_subtree_suffix("dir/", "dir/f.txt"),
+            Some("/f.txt".into())
+        );
+        assert_eq!(member_form("dir"), "dir");
+        assert_eq!(member_subtree_suffix("dir", "dirish/f.txt"), None);
+        assert_eq!(
+            member_subtree_suffix("dir", "DIR/f.txt"),
+            Some("/f.txt".into())
+        );
+        // A decomposed subtree is named by its composed prefix and keeps the raw suffix.
+        let composed_dir = "\u{d55c}\u{ae00}";
+        let decomposed_dir = "\u{1112}\u{1161}\u{11ab}\u{1100}\u{1173}\u{11af}";
+        assert_eq!(
+            member_subtree_suffix(composed_dir, &format!("{decomposed_dir}/file.txt")),
+            Some("/file.txt".into())
+        );
+        assert_eq!(
+            member_subtree_suffix(COMPOSED, DECOMPOSED),
+            Some(String::new())
+        );
+    }
 }

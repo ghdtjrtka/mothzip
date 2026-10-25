@@ -11,7 +11,8 @@ use super::model::{
 };
 use super::path::{add_dir_to_user_path, is_dir_in_user_path, remove_dir_from_user_path};
 use super::registry::{
-    import_reg_file, unregister_all_keys, write_reg_file, RegistryProfile, SUPPORTED_EXTENSIONS,
+    run_registration_lifecycle, unregister_all_keys, RegistrationOutcome, RegistrationPhase,
+    RegistryProfile, SUPPORTED_EXTENSIONS,
 };
 use super::shortcut::{
     create_start_menu_shortcut, remove_start_menu_shortcut, verify_shortcut_target,
@@ -113,13 +114,22 @@ pub fn install(options: &InstallOptions) -> Result<InstallReport, ShellError> {
         }
     };
     let mut path_added = false;
-    let configure: Result<(Option<std::path::PathBuf>, VerificationReport), ShellError> = (|| {
-        let reg = stage.join("registration.reg");
-        write_reg_file(&reg, &profile.generate_reg_content())?;
-        import_reg_file(&reg)?;
-        // Earlier releases registered two extra extraction verbs; an upgrade must not leave them
-        // behind, so the retired keys are deleted in the same configuration step.
-        super::registry::remove_legacy_verbs(SUPPORTED_EXTENSIONS)?;
+    let configure: Result<
+        (
+            Option<std::path::PathBuf>,
+            VerificationReport,
+            RegistrationOutcome,
+        ),
+        ShellError,
+    > = (|| {
+        // One lifecycle call writes the declared profile, drops the values earlier releases
+        // left behind, and retires the 1.0.x verbs.
+        let lifecycle = run_registration_lifecycle(
+            &profile,
+            SUPPORTED_EXTENSIONS,
+            RegistrationPhase::Apply,
+            None,
+        )?;
         let shortcut_path = if options.no_shortcut {
             None
         } else {
@@ -148,9 +158,9 @@ pub fn install(options: &InstallOptions) -> Result<InstallReport, ShellError> {
                 message: format!("{:?}", verified),
             });
         }
-        Ok((shortcut_path, verified))
+        Ok((shortcut_path, verified, lifecycle))
     })();
-    let (shortcut_path, verified) = match configure {
+    let (shortcut_path, verified, lifecycle) = match configure {
         Ok(done) => done,
         Err(error) => {
             let mut recovery = Vec::new();
@@ -214,6 +224,9 @@ pub fn install(options: &InstallOptions) -> Result<InstallReport, ShellError> {
         start_menu_shortcut: shortcut_path,
         user_path_updated: path_added,
         verified,
+        purged_registry_values: lifecycle.removed_values,
+        removed_registry_subkeys: lifecycle.removed_subkeys,
+        residual_registry_subkeys: lifecycle.residual_subkeys,
     })
 }
 
@@ -236,7 +249,6 @@ pub fn uninstall(options: &UninstallOptions) -> Result<UninstallReport, ShellErr
     let target = &manifest.exe_path;
     let self_removal = fs::canonicalize(&current)? == fs::canonicalize(target)?;
     unregister_all_keys(target, SUPPORTED_EXTENSIONS)?;
-    super::registry::remove_legacy_verbs(SUPPORTED_EXTENSIONS)?;
     let removed_shortcut = remove_start_menu_shortcut(Some(target))?;
     let path_cleaned = if options.keep_path {
         false
@@ -379,8 +391,6 @@ pub fn register(options: &RegisterOptions) -> Result<RegisterReport, ShellError>
         .join("mothzip_register.reg");
 
     let profile = RegistryProfile::build(&current_exe, false, SUPPORTED_EXTENSIONS);
-    let content = profile.generate_reg_content();
-    write_reg_file(&reg_path, &content)?;
 
     let shortcut_path = if !options.no_shortcut {
         Some(create_start_menu_shortcut(&current_exe, None)?)
@@ -388,7 +398,14 @@ pub fn register(options: &RegisterOptions) -> Result<RegisterReport, ShellError>
         None
     };
 
-    import_reg_file(&reg_path)?;
+    // Portable registration shares the install lifecycle, so an upgrade from 1.0.x drops the
+    // retired verbs here too instead of keeping a duplicated menu.
+    run_registration_lifecycle(
+        &profile,
+        SUPPORTED_EXTENSIONS,
+        RegistrationPhase::Apply,
+        Some(&reg_path),
+    )?;
     let verified = profile.verify_registered()?
         && match &shortcut_path {
             Some(path) => verify_shortcut_target(path, &current_exe)?,

@@ -656,17 +656,39 @@ fn extract_rar_archive(
                     }
                 })?;
 
-            let is_rar5 = archives
-                .first()
-                .map(|a| a.family() == rars::ArchiveFamily::Rar50Plus)
-                .unwrap_or(false);
+            // The volume callback carries only name, time and directory, so the declared
+            // payload size and the redirection flag come from the logical-member inventory the
+            // catalog is read from: one member per callback, in archive order. Both paths then
+            // account bytes and reject links through the same member metadata.
+            let members = rars::volume_members(&archives)
+                .map_err(|e| format!("RAR volume member read failed: {}", e))?;
+            if let Some(link) = members.iter().find(|member| member.meta.is_redirection) {
+                let name = super::encoding::compose_hangul_nfc(
+                    &super::encoding::decode_entry_name_raw(&link.meta.name),
+                );
+                return Err(format!(
+                    "Unsupported entry '{name}': RAR links/redirections are not supported for extraction"
+                )
+                .into());
+            }
+            let mut logical = members.into_iter();
 
             rars::extract_volumes_to_with_options(&archives, options, |entry_meta| {
+                let member = logical.next().ok_or_else(|| {
+                    rars::Error::from(io::Error::other(
+                        "RAR volume entry has no logical member metadata",
+                    ))
+                })?;
+                if member.meta.name != entry_meta.name {
+                    return Err(rars::Error::from(io::Error::other(
+                        "RAR volume entry order disagrees with the logical member inventory",
+                    )));
+                }
                 let raw_name =
-                    super::encoding::decode_entry_name_raw(&entry_meta.name).replace('\\', "/");
+                    super::encoding::decode_entry_name_raw(&member.meta.name).replace('\\', "/");
                 let norm_name = super::encoding::compose_hangul_nfc(&raw_name);
 
-                if entry_meta.is_directory {
+                if member.meta.is_directory {
                     if !flat {
                         let sanitized =
                             sanitize_entry_path(&resolved_target, &norm_name).map_err(|_| {
@@ -698,21 +720,31 @@ fn extract_rar_archive(
                 let out_file = File::create(&temp_path)
                     .map_err(|e| rars::Error::from(io::Error::other(e.to_string())))?;
 
-                let mtime = entry_meta.file_time.and_then(|ft| {
-                    if is_rar5 {
-                        super::format::unix_secs_to_system_time(ft as u64)
-                    } else {
-                        let dos_date = (ft >> 16) as u16;
-                        let dos_time = (ft & 0xFFFF) as u16;
-                        super::format::dos_time_to_system_time(dos_date, dos_time)
-                    }
-                });
+                let mtime = member
+                    .meta
+                    .file_time
+                    .and_then(|ft| match member.meta.family {
+                        rars::ArchiveFamily::Rar50Plus => {
+                            super::format::unix_secs_to_system_time(ft as u64)
+                        }
+                        _ => {
+                            let dos_date = (ft >> 16) as u16;
+                            let dos_time = (ft & 0xFFFF) as u16;
+                            super::format::dos_time_to_system_time(dos_date, dos_time)
+                        }
+                    });
 
                 staged_files.push(StagedFile {
                     temp_path,
                     final_dest,
                     mtime,
                 });
+
+                extracted_bytes = extracted_bytes
+                    .checked_add(member.meta.unpacked_size)
+                    .ok_or_else(|| {
+                        rars::Error::from(io::Error::other("Archive uncompressed size overflow"))
+                    })?;
 
                 Ok(Box::new(out_file))
             })
@@ -1844,5 +1876,136 @@ mod tests {
         }
 
         let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    /// Defect B through the extraction path: `--member` resolves one member whether the archive
+    /// stores the decomposed form or the request carries it, and an unrelated literal stays
+    /// rejected before anything is written.
+    #[test]
+    fn selected_extraction_resolves_both_hangul_compositions() {
+        const COMPOSED: &str = "\u{d55c}\u{ae00}.txt";
+        const DECOMPOSED: &str = "\u{1112}\u{1161}\u{11ab}\u{1100}\u{1173}\u{11af}.txt";
+        let temp_dir = PathBuf::from("target").join(format!(
+            "test_selected_hangul_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::create_dir_all(&temp_dir);
+
+        for (index, (stored, requested)) in [(DECOMPOSED, COMPOSED), (COMPOSED, DECOMPOSED)]
+            .into_iter()
+            .enumerate()
+        {
+            let archive = temp_dir.join("fixture.zip");
+            let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+            let options =
+                SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+            writer.start_file(stored, options).unwrap();
+            std::io::Write::write_all(&mut writer, b"HANGUL").unwrap();
+            writer.start_file("other.txt", options).unwrap();
+            std::io::Write::write_all(&mut writer, b"OTHER").unwrap();
+            fs::write(&archive, writer.finish().unwrap().into_inner()).unwrap();
+
+            let out = temp_dir.join(format!("out_{index}"));
+            let summary = extract_archive_with_options(
+                &archive,
+                &out,
+                &ExtractionOptions {
+                    members: vec![requested.to_string()],
+                    ..ExtractionOptions::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(summary.extracted_files, 1);
+            assert_eq!(fs::read(out.join(COMPOSED)).unwrap(), b"HANGUL");
+            assert!(!out.join("other.txt").exists());
+
+            let missing = temp_dir.join("out_missing");
+            let error = extract_archive_with_options(
+                &archive,
+                &missing,
+                &ExtractionOptions {
+                    members: vec!["\u{b2e4}\u{b978}.txt".to_string()],
+                    ..ExtractionOptions::default()
+                },
+            )
+            .expect_err("a literal the archive does not hold must be rejected");
+            assert!(error.to_string().contains("not found"), "{error}");
+            assert!(!missing.exists());
+        }
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    /// Defect C: the multivolume RAR callback opened real destination files but never added
+    /// their size to the extraction summary, so a successful 207,050-byte unpack reported
+    /// `extracted_bytes: 0`. The declared size comes from the same logical member the
+    /// single-volume path reads it from.
+    #[test]
+    fn rar_volumes_report_the_extracted_bytes_and_match_the_payload() {
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("audit")
+            .join("runs")
+            .join("rar-reference-20261025-201124")
+            .join("rarfile-rar5-vols.part1");
+        let first_volume = fixture.join("rar5-vols.part1.rar");
+        // The rar reference runs are generated by audit/delegation/make-rar-reference.py and
+        // `audit/runs/` is not part of the source checkout, so the case runs only where the
+        // fixture is present instead of being skipped as an ignored test.
+        if !first_volume.is_file() {
+            return;
+        }
+
+        let out_dir = PathBuf::from("target").join(format!(
+            "test_rar5_volumes_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::create_dir_all(&out_dir);
+
+        let summary = extract_archive(
+            &first_volume,
+            &out_dir,
+            false,
+            false,
+            None,
+            crate::core::guard::DEFAULT_MAX_UNCOMPRESSED_BYTES,
+        )
+        .unwrap();
+
+        let oracle = fixture.join("oracle");
+        let mut expected_bytes = 0u64;
+        let mut payloads = 0usize;
+        for entry in walkdir::WalkDir::new(&oracle).into_iter().flatten() {
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let relative = entry.path().strip_prefix(&oracle).unwrap();
+            let expected = fs::read(entry.path()).unwrap();
+            expected_bytes += expected.len() as u64;
+            payloads += 1;
+            assert_eq!(
+                fs::read(out_dir.join(relative)).unwrap(),
+                expected,
+                "extracted payload differs: {}",
+                relative.display()
+            );
+        }
+
+        assert!(payloads > 1, "the volume fixture must carry a split member");
+        assert_ne!(
+            summary.extracted_bytes, 0,
+            "a successful multivolume extraction must account its bytes"
+        );
+        assert_eq!(summary.extracted_bytes, expected_bytes);
+        assert_eq!(summary.extracted_files, payloads);
+
+        let _ = fs::remove_dir_all(&out_dir);
     }
 }

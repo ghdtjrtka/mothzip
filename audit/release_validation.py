@@ -148,6 +148,46 @@ for ext in ('tar','tar.gz','gz'):
     call=invoke('pack',dest,src,'--password-stdin',input_bytes=b'fixture-only\n')
     record(d.name,[call],original_preserved=dest.read_bytes()==b'ORIGINAL')
 
+# A failed --from-stdin run used to truncate an existing output before validating anything.
+d=fixture_dir('final-stream-atomic-level')
+dest=d/'keep.gz'
+dest.write_bytes(b'ORIGINAL-BYTES')
+call=invoke('pack',dest,'--from-stdin','--format','gz','--level','22',input_bytes=b'payload that must not be written\n')
+record(d.name,[call],original_preserved=dest.read_bytes()==b'ORIGINAL-BYTES',
+    no_staging=not list(d.glob('.mothzip_stream*')))
+
+# A stream that cannot be read to the end (stdin closed early) must not replace the destination either.
+d=fixture_dir('final-stream-atomic-container')
+dest=d/'keep.gz'
+dest.write_bytes(b'ORIGINAL-BYTES')
+call=invoke('pack',dest,'--from-stdin','--format','zip',input_bytes=b'payload\n')
+record(d.name,[call],original_preserved=dest.read_bytes()==b'ORIGINAL-BYTES',
+    no_staging=not list(d.glob('.mothzip_stream*')))
+
+# The options that cannot apply to a pipe are argument errors, not silent no-ops.
+d=fixture_dir('final-stream-rejects-pipe-options')
+dest=d/'out.gz'
+conflicts=[]
+for extra in (['--password','secret'],['--password-stdin'],['--reproducible'],['--7z-dict','4'],
+              ['--volume-bytes','65536'],['a.txt']):
+    kwargs={'input_bytes':b'secret\n'} if '--password-stdin' in extra else {'input_bytes':b'x'}
+    call=invoke('pack',dest,'--from-stdin','--format','gz',*extra,**kwargs)
+    conflicts.append(call.get('exit_code'))
+record(d.name,[],conflict_exits=conflicts,no_output=not dest.exists())
+
+# A successful stream pack must equal the same bytes compressed from a file.
+d=fixture_dir('final-stream-matches-file')
+payload=b'stream equivalence payload\n'*64
+src=d/'payload.zst'
+invoke('pack',src,'--from-stdin','--format','zst',input_bytes=payload)
+produced=d/'produced.zst'
+invoke('pack',produced,'--from-stdin','--format','zst',input_bytes=payload)
+unpack=invoke('unpack',src,'-o',d/'out')
+restored=list((d/'out').rglob('*')) if (d/'out').exists() else []
+restored=[p for p in restored if p.is_file()]
+record(d.name,[unpack],same_bytes=src.read_bytes()==produced.read_bytes(),
+    restored=len(restored)==1 and restored[0].read_bytes()==payload)
+
 d=fixture_dir('final-headless-no-open')
 call=invoke('unpack',d/'anything.zip','--open','--non-interactive')
 record(d.name,[call],json_error=bool(json.loads(call.get('stderr','{}')).get('error')))
@@ -228,6 +268,9 @@ for test in base['results']:
     elif name.startswith('final-pack-inventory-'): require(all(c.get('exit_code')==0 for c in calls) and o['inventory_matches'],name,'source inventory lost or included a file')
     elif name.startswith('final-password-contract-'): require([c.get('exit_code') for c in calls]==[0,0,1] and o['content_matches'],name,'password or global argument contract failed')
     elif name=='final-pack-single-link' or name.startswith('final-reject-password-'): require(code==1 and o['original_preserved'],name,'unsupported source/option modified destination')
+    elif name.startswith('final-stream-atomic-'): require(code==1 and o['original_preserved'] and o['no_staging'],name,'failed stdin pack modified the destination')
+    elif name=='final-stream-rejects-pipe-options': require(o['conflict_exits']==[2,2,2,2,2,2] and o['no_output'],name,'pipe option silently ignored')
+    elif name=='final-stream-matches-file': require(o['same_bytes'] and o['restored'],name,'stdin stream differs from the file form')
     elif name=='final-headless-no-open': require(code==2 and o['json_error'],name,'headless command accepted desktop window')
     elif name.startswith('final-configurable-budget-'): require([c.get('exit_code') for c in calls]==[0,1,0,1,0,1,0] and o['original_preserved'] and o['restored'] and o['stream_matches'],name,'byte budget ignored or could not be raised')
     else: require(False,name,'missing release assertion')

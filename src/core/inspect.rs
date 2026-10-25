@@ -240,44 +240,33 @@ fn cat_zip_file<W: Write>(
     let mut archive = ZipArchive::new(file)?;
 
     let target_raw = target_entry_path.replace('\\', "/");
-    let target_normalized = crate::core::encoding::compose_hangul_nfc(&target_raw);
 
-    // Pass 1: Find best matching entry index by metadata WITHOUT decrypting
-    let mut exact_match = None;
-    let mut normalized_match = None;
-    let mut case_match = None;
-
+    // Pass 1: Find best matching entry index by metadata WITHOUT decrypting.
+    //
+    // The ranking comes from `catalog::member_match_rank`, the same rule `delete`, `rename` and
+    // `--member` use; keeping the order here (exact, then composed, then ASCII case-insensitive)
+    // means `cat` cannot resolve a name differently from the commands that edit or select it.
+    let mut best: Option<(u8, usize)> = None;
     for i in 0..archive.len() {
         let entry = archive.by_index_raw(i)?;
-        let name_raw = super::encoding::decode_entry_name_raw(entry.name_raw()).replace('\\', "/");
-        let name_normalized = crate::core::encoding::compose_hangul_nfc(&name_raw);
-
-        if name_raw == target_raw {
-            exact_match = Some(i);
-            break;
-        }
-        if normalized_match.is_none()
-            && (name_normalized == target_normalized
-                || name_normalized.trim_start_matches('/')
-                    == target_normalized.trim_start_matches('/'))
-        {
-            normalized_match = Some(i);
-        }
-        if case_match.is_none() && name_normalized.eq_ignore_ascii_case(&target_normalized) {
-            case_match = Some(i);
+        let name_raw = super::encoding::decode_entry_name_raw(entry.name_raw());
+        match crate::core::catalog::member_match_rank(&target_raw, &name_raw) {
+            Some(0) => {
+                best = Some((0, i));
+                break;
+            }
+            Some(rank) if best.is_none_or(|(current, _)| rank < current) => best = Some((rank, i)),
+            _ => {}
         }
     }
 
-    let chosen_idx = exact_match
-        .or(normalized_match)
-        .or(case_match)
-        .ok_or_else(|| {
-            format!(
-                "File '{}' not found inside archive '{}'",
-                target_entry_path,
-                archive_path.display()
-            )
-        })?;
+    let chosen_idx = best.map(|(_, index)| index).ok_or_else(|| {
+        format!(
+            "File '{}' not found inside archive '{}'",
+            target_entry_path,
+            archive_path.display()
+        )
+    })?;
 
     // Pass 2: Decrypt and stream ONLY the chosen index
     let mut entry = match password {
@@ -316,7 +305,6 @@ fn cat_tar_file<W: Write>(
     max_bytes: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let target_raw = target_entry_path.replace('\\', "/");
-    let target_normalized = crate::core::encoding::compose_hangul_nfc(&target_raw);
 
     // Pass 1: exact match
     let reader = super::format::open_tar_reader(archive_path, codec, max_bytes)?;
@@ -328,7 +316,7 @@ fn cat_tar_file<W: Write>(
         let raw_name = path_cow.to_string_lossy().to_string();
         let name_raw = raw_name.replace('\\', "/");
 
-        if name_raw == target_raw {
+        if crate::core::catalog::member_match_rank(&target_raw, &name_raw) == Some(0) {
             if entry.header().entry_type().is_dir() {
                 return Err(format!("'{}' is a directory, not a file", target_entry_path).into());
             }
@@ -347,12 +335,8 @@ fn cat_tar_file<W: Write>(
         let path_cow = entry.path()?;
         let raw_name = path_cow.to_string_lossy().to_string();
         let name_raw = raw_name.replace('\\', "/");
-        let name_normalized = crate::core::encoding::compose_hangul_nfc(&name_raw);
 
-        if name_normalized == target_normalized
-            || name_normalized.trim_start_matches('/') == target_normalized.trim_start_matches('/')
-            || name_normalized.eq_ignore_ascii_case(&target_normalized)
-        {
+        if crate::core::catalog::member_match_rank(&target_raw, &name_raw).is_some() {
             if entry.header().entry_type().is_dir() {
                 return Err(format!("'{}' is a directory, not a file", target_entry_path).into());
             }
@@ -379,22 +363,17 @@ fn cat_7z_file<W: Write>(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let catalog = read_archive_catalog(archive_path, password, max_bytes)?;
     let target_raw = target_entry_path.replace('\\', "/");
-    let target_norm = crate::core::encoding::compose_hangul_nfc(&target_raw);
 
+    // Lowest rank wins, and the catalog order breaks a tie, so an exact member always beats a
+    // composed or case-insensitive one. The ranking rule itself lives in `catalog`.
     let chosen = catalog
         .iter()
-        .find(|e| e.name == target_raw)
-        .or_else(|| {
-            catalog.iter().find(|e| {
-                e.name == target_norm
-                    || e.name.trim_start_matches('/') == target_norm.trim_start_matches('/')
-            })
+        .filter_map(|entry| {
+            crate::core::catalog::member_match_rank(&target_raw, &entry.name)
+                .map(|rank| (rank, entry))
         })
-        .or_else(|| {
-            catalog
-                .iter()
-                .find(|e| e.name.eq_ignore_ascii_case(&target_norm))
-        })
+        .min_by_key(|(rank, _)| *rank)
+        .map(|(_, entry)| entry)
         .ok_or_else(|| {
             format!(
                 "File '{}' not found inside archive '{}'",
@@ -525,22 +504,16 @@ fn cat_rar_file<W: Write + 'static>(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let catalog = read_archive_catalog(archive_path, password, max_bytes)?;
     let target_raw = target_entry_path.replace('\\', "/");
-    let target_norm = crate::core::encoding::compose_hangul_nfc(&target_raw);
 
+    // Same ranked rule as every other reader and writer; see `catalog::member_match_rank`.
     let chosen = catalog
         .iter()
-        .find(|e| e.name == target_raw)
-        .or_else(|| {
-            catalog.iter().find(|e| {
-                e.name == target_norm
-                    || e.name.trim_start_matches('/') == target_norm.trim_start_matches('/')
-            })
+        .filter_map(|entry| {
+            crate::core::catalog::member_match_rank(&target_raw, &entry.name)
+                .map(|rank| (rank, entry))
         })
-        .or_else(|| {
-            catalog
-                .iter()
-                .find(|e| e.name.eq_ignore_ascii_case(&target_norm))
-        })
+        .min_by_key(|(rank, _)| *rank)
+        .map(|(_, entry)| entry)
         .ok_or_else(|| {
             format!(
                 "File '{}' not found inside archive '{}'",

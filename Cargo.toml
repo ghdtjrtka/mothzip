@@ -1,6 +1,6 @@
 [package]
 name = "mothzip"
-version = "1.2.1"
+version = "1.2.2"
 edition = "2021"
 rust-version = "1.93"
 
@@ -32,3 +32,9 @@ windows-sys = { version = "0.61", features = [
 
 [build-dependencies]
 embed-resource = "3.0.12"
+
+[profile.release]
+# A panic in this tool is a bug, not a recoverable state, and the unwinding tables cost about
+# 1.7 MB of an 8 MB download. Nothing in the tree uses `catch_unwind`, so the release profile
+# aborts; `cargo test` runs in the default profile and keeps unwinding.
+panic = "abort"

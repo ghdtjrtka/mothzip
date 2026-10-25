@@ -1,6 +1,6 @@
 # MothZip CLI contract for scripts, CI, and agents
 
-**Version 1.2.1** (Windows 10/11 x64, MIT). This page documents what a program can rely on when it drives `mothzip.exe`: the flags that exist, the JSON on each stream, how failure is signalled, and which integrity guarantees do **not** exist. It is a contract page, not a tutorial.
+**Version 1.2.2** (Windows 10/11 x64, MIT). This page documents what a program can rely on when it drives `mothzip.exe`: the flags that exist, the JSON on each stream, how failure is signalled, and which integrity guarantees do **not** exist. It is a contract page, not a tutorial.
 
 Every command line in sections 1–8 was executed against the shipped build on Windows before it was written; output blocks are real captures, not illustrations. Measured limits are marked **measured**; figures quoted from this repository's perf runs are marked as such, and the CLI additions at the end were run against the same build.
 
@@ -26,7 +26,7 @@ Global options are accepted before or after the subcommand.
 | --- | --- | --- |
 | `unpack <ARCHIVE>` | `-o/--out <DIR>`, `--to-folder`, `--member <PATH>` (repeatable), `--flat`, `--open` | Extraction summary JSON |
 | `smart-unpack <ARCHIVE>` | same as `unpack` | Extraction summary JSON; `smart_adjusted` reports folder wrapping |
-| `pack <OUTPUT> <SOURCES>...` | `-l/--level <0-22>`, `--format <fmt>`, `--volume-bytes <N>` (7z only), `--to-stdout`, `--from-stdin`, `--7z-dict <MiB>`, `--reproducible`, `--reproducible` | Archive summary JSON; no summary with `--to-stdout` |
+| `pack <OUTPUT> <SOURCES>...` | `-l/--level <0-22>`, `--format <fmt>`, `--volume-bytes <N>` (7z only), `--to-stdout`, `--from-stdin`, `--7z-dict <MiB>`, `--reproducible` | Archive summary JSON; no summary with `--to-stdout` |
 | `pack-auto <SOURCES>...` | `--format <fmt>` (default `zip`) | Archive summary JSON; writes beside the selection |
 | `open <ARCHIVE>` | none | Browsing window; exit 1 under `--non-interactive` |
 | `peek <ARCHIVE>` | `--depth <N>` (default 2), `--limit <N>` (default 50) | Structure JSON; bounded display only |
@@ -48,8 +48,8 @@ Rules that matter to callers:
 - `--open` conflicts with both `--json` and `--non-interactive`; either combination is rejected as an invalid command line (exit 2) before any work starts.
 - A mistyped subcommand is **not** a usage error. A first token that is not a known command is treated as an archive path for implicit smart extraction, so `mothzip frobnicate` exits 1 with a path error. Validate command names in your wrapper instead of relying on exit 2.
 - `cat` always writes payload bytes, with or without `--json`. With `--json` the bytes are unchanged; there is no JSON wrapper for `cat`.
-- `--from-stdin` compresses the bytes on stdin into a **single-stream** archive (`gz`, `zst`, `xz`, `lz4`, `br`); `SOURCES` are then omitted and a container format is refused with exit 1 (`--from-stdin writes a single compressed stream; ZIP needs entry names, so pack it from files instead`). It composes with `--to-stdout`, so `cat file | mothzip pack out.zst --from-stdin --format zst --to-stdout > copy.zst` never touches the disk.
-- `--to-stdout` still requires the positional `OUTPUT`; that path only selects the format (`mothzip pack out.zip src --to-stdout > out.zip`). It conflicts with `--json` and `--volume-bytes` (exit 2, 0 bytes on stdout), and 7z is refused with exit 1 because it rewrites its signature header and needs a seekable output. There is no staging or commit step, so a failure can follow bytes already written; a downstream pipe that closes early is a normal success (exit 0). `--format` forces the container instead of deriving it from the output suffix. There is still no stdin archive form: `pack - …` exits 0 after creating a file literally named `-`.
+- `--from-stdin` compresses the bytes on stdin into a **single-stream** archive (`gz`, `zst`, `xz`, `lz4`, `br`); a container is refused with exit 1 (`--from-stdin writes a single compressed stream; ZIP needs entry names, so pack it from files instead`). It is as atomic as an archive built from files: the level is validated and the bytes are staged beside the destination before the destination is replaced, so a failed run leaves an existing output byte-identical (measured: a 14-byte `keep.gz` stayed 14 bytes when `--level 22` was rejected). Options that cannot apply to a pipe are refused as argument errors (exit 2) instead of being ignored: `--password`, `--reproducible`, `--7z-dict`, `--volume-bytes`, and any positional `SOURCES`. It composes with `--to-stdout`, so `cat file | mothzip pack out.zst --from-stdin --format zst --to-stdout > copy.zst` never touches the disk (that path is the only non-atomic one: stdout cannot be rolled back).
+- `--to-stdout` still requires the positional `OUTPUT`; that path only selects the format (`mothzip pack out.zip src --to-stdout > out.zip`). It conflicts with `--json` and `--volume-bytes` (exit 2, 0 bytes on stdout), and 7z is refused with exit 1 because it rewrites its signature header and needs a seekable output. There is no staging or commit step, so a failure can follow bytes already written; a downstream pipe that closes early is a normal success (exit 0). `--format` forces the container instead of deriving it from the output suffix. `-` is not a stdin convention here: `pack - …` creates a file literally named `-`, so use `--from-stdin` when the bytes come from a pipe.
 
 ### Exit codes
 
@@ -167,7 +167,7 @@ The message text is not a stable API — OS-derived parts are localized on non-E
 
 `--max-bytes N` bounds decompressed bytes for every path that expands payload — `unpack`, `smart-unpack`, `cat`, and `test` — with a default of 10 GiB. Exceeding it fails the operation (exit 1) and leaves the destination untouched. Measured with a 5-byte budget: `cat` produced 0 bytes and exit 1, `unpack` created no files, and an existing file at the destination kept its original content.
 
-Two deliberate exceptions, both measured: `peek` lists structure without decompressing and is not bounded by the budget, and `pack` compresses (it does not expand) so the budget does not apply. Raise the budget explicitly for large or highly compressible inputs; the byte count includes TAR headers and padding. This is not a CPU-time or memory sandbox.
+Two deliberate exceptions, both measured: `peek` lists structure without decompressing and is not bounded by the budget, and `pack` compresses (it does not expand) so the budget does not apply. Raise the budget explicitly for large or highly compressible inputs; the byte count includes TAR headers and padding. That difference is measurable and deliberate: with a 1000-byte member, `pack k.zip`/`k.7z` read at `--max-bytes 1000`, while `k.tar` needs 2559 because it counts the container stream it actually reads (headers and padding included). Budget for the container, not only for the payload, when you read TAR or TAR+codec. This is not a CPU-time or memory sandbox.
 
 ## 6. Integrity guarantees
 
@@ -271,6 +271,9 @@ Both snippets were executed: success paths returned the JSON above, a corrupted 
 ## 9. Known limitations
 
 - **7z creation memory is set by the LZMA2 dictionary, and `--7z-dict` controls it.** Measured on a 60 MB text input (peak RSS, output size relative to the default):
+
+  It is refused (exit 1) for any destination that is not 7z, because a silently ignored setting would tell a caller it had been applied. The upper bound is the LZMA2 format limit (1536 MiB) and the memory it costs scales with it by the measured factor below, so pick the value from the memory you have rather than the maximum.
+
   | `--7z-dict` | peak RSS | output size |
   | --- | --- | --- |
   | default (level 5 → 8 MiB) | 85.1 MiB | baseline |
@@ -278,10 +281,10 @@ Both snippets were executed: success paths returned the JSON above, a corrupted 
   | 2 | **28.1 MiB** | +0.30% |
   | 1 | **18.5 MiB** | +1.2% |
   | 16 | 161.1 MiB | −0.001% |
-  The dictionary is the match finder's state (about 10.5 MiB of peak RSS per MiB of dictionary), so this is the only lever that does not depend on the level. Anything above the input size buys nothing: 16 MiB was smaller than the payload and produced a marginally *smaller* file than 8 MiB. The 7z header itself is compressed by the crate with its own dictionary, so a commit still costs tens of MiB regardless of `--7z-dict`. Level guidance still applies: level 1 = 15.7 MiB, 4 = 54.4 MiB, 5 = 100.35 MiB, 9 = 603.8 MiB at 60 MB with the default dictionary.
+  The dictionary is the match finder's state (about 10.5 MiB of peak RSS per MiB of dictionary), so this is the only lever that does not depend on the level. Anything above the input size buys nothing: 16 MiB was smaller than the payload and produced a marginally *smaller* file than 8 MiB. The 7z header itself is compressed by the crate with its own dictionary, so a commit still costs tens of MiB regardless of `--7z-dict`. The level does not change the factor; it only picks the default dictionary (level 0-1 = 256 KiB/1 MiB, 2-4 = 2/4/4 MiB, 5-6 = 8 MiB, 7-9 = 16/32/64 MiB), so multiply the dictionary you get by the same ~10.5 MiB per MiB. With no flag, level 5 means an 8 MiB dictionary and the 85.1 MiB peak above.
 - **Raising the level raises memory sharply, not only for 7z.** On the 32 MiB mixed baseline used for the perf suite: `pack f.tar.zst --level 22` peaked at **744.6 MiB** against **10.8 MiB** at the default zstd level (3), `pack f.7z` at level 9 peaked at **360.2 MiB** against **100.4 MiB** at the default level (5), and solid `unpack` of a 7z archive peaked at **71.1 MiB** while every other unpack path stayed at **7.6–9.9 MiB**. These are environment-dependent measurements, not ceilings. Keep the default level for large inputs; for large 7z output use `--level 4` or lower.
 - **Throughput is not a published guarantee.** Repeating the same script against the same binary moved CPU-bound cases (`7z`, maximum-level `zstd`) by up to **43%** under concurrent load — `pack f.7z` at the default level took 11.3 s in one run and 16.2 s in another. This page therefore quotes no MB/s figures; regression checks use a **±10%** band for ordinary cases and **±25%** for CPU-bound cases instead of an absolute target.
-- **Brotli cannot detect corruption** (no payload checksum), and TAR carries no payload checksum at all. See the table in §6.
+- **Brotli cannot detect corruption** (no payload checksum), and TAR carries no payload checksum at all. A corrupted Brotli stream therefore fails only when the bitstream no longer decodes; a flip that still decodes is returned as data. See the table in §6.
 - **`--to-stdout` is not a transaction.** 7z output is refused (it needs a seekable stream), there is no staging or commit, and a failure can follow bytes already emitted. Treat stdout as untrusted until exit 0.
 - **Encrypted archives are not reproducible.** `--reproducible` cannot make an AES-encrypted archive byte-identical: two runs of the same password-protected ZIP differed (measured), because AES uses a random IV.
 - **Windows only.** Windows 10/11 x64; archive links and device objects are unsupported, common macOS/Explorer metadata is filtered, and release binaries are not code-signed.
@@ -345,6 +348,6 @@ cmd /c "mothzip.exe pack out.zip src --to-stdout > out.zip"
 
 **`--volume-bytes` accepts any output path.** A bare relative name no longer fails with `os error 3`; bare, `.\`-prefixed, absolute, and subfolder paths all succeed, and stale higher-numbered parts from a previous set are removed. See §7.
 
-**7z write memory was diagnosed, not reduced.** The level curve, the LZMA2 match-finder cause, and the ~94 MiB commit cost are in §9; prefer `--level 4` or lower for large 7z output.
+**7z write memory follows the LZMA2 dictionary.** The match-finder state and the measured dictionary table are in §9; prefer `--level 4` (4 MiB dictionary, about 47 MiB peak) or `--7z-dict` for large 7z output.
 
 See [`docs/RELEASE.md`](RELEASE.md) for packaging and the release checklist.

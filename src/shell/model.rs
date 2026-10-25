@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+use super::registry::StaleRegistryValue;
+
 #[derive(Debug, Clone, Default)]
 pub struct InstallOptions {
     pub dir: Option<PathBuf>,
@@ -29,6 +31,15 @@ pub struct InstallReport {
     pub start_menu_shortcut: Option<PathBuf>,
     pub user_path_updated: bool,
     pub verified: VerificationReport,
+    /// Values earlier releases declared and this profile no longer does, removed from the
+    /// owned keys by the install lifecycle.
+    pub purged_registry_values: Vec<StaleRegistryValue>,
+    /// Child keys removed because they turn a declared submenu back into a plain command (the
+    /// `command` an earlier release wrote for the verb that is now a cascade).
+    pub removed_registry_subkeys: Vec<String>,
+    /// Child keys found under owned keys that the profile does not declare and cannot prove it
+    /// owns. They are never deleted; the operator decides what to do with them.
+    pub residual_registry_subkeys: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default)]

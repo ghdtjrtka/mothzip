@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::env;
 use std::fs::{self, File};
 use std::io::{self, Write};
@@ -65,15 +66,21 @@ pub fn legacy_verb_keys(extensions: &[&str]) -> Vec<String> {
     keys
 }
 
+/// The .reg body that retires the verb keys of earlier releases. It contains nothing but the
+/// owned verb subtrees from `legacy_verb_keys`.
+fn legacy_verb_deletion_reg_content(extensions: &[&str]) -> String {
+    let mut content = String::from("Windows Registry Editor Version 5.00\r\n\r\n");
+    for key in legacy_verb_keys(extensions) {
+        content.push_str(&format!("[-{key}]\r\n"));
+    }
+    content
+}
+
 /// Delete the verb keys of earlier releases. Only MothZip-owned verb subtrees are removed.
 pub fn remove_legacy_verbs(extensions: &[&str]) -> Result<Vec<String>, ShellError> {
     let keys = legacy_verb_keys(extensions);
-    let mut content = String::from("Windows Registry Editor Version 5.00\r\n\r\n");
-    for key in &keys {
-        content.push_str(&format!("[-{key}]\r\n"));
-    }
     let temp_reg = unique_temp_path("mothzip_legacy_", "reg");
-    write_reg_file(&temp_reg, &content)?;
+    write_reg_file(&temp_reg, &legacy_verb_deletion_reg_content(extensions))?;
     let result = import_reg_file(&temp_reg);
     let _ = fs::remove_file(&temp_reg);
     result?;
@@ -89,6 +96,56 @@ fn escape_reg_data(s: &str) -> String {
 /// Escape a value-name for serialization inside a .reg file.
 fn escape_reg_name(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Case-insensitive identity of a registry value or child-key name. Windows compares these
+/// names without regard to case, so the declared footprint is folded before comparison.
+fn fold_name(name: &str) -> String {
+    name.to_lowercase()
+}
+
+/// A registry value that the running profile no longer declares. Such values are what an
+/// earlier release wrote and this release dropped; they are removed from owned keys.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct StaleRegistryValue {
+    pub key: String,
+    pub name: String,
+}
+
+/// Outcome of one owned-key sweep: values and verb artifacts that were removed, and subkeys
+/// that were left alone because the profile cannot prove it owns them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct StaleValues {
+    removed: Vec<StaleRegistryValue>,
+    removed_subkeys: Vec<String>,
+    residual_subkeys: Vec<String>,
+}
+
+/// A child key that turns a cascading verb back into a plain one.
+///
+/// `MothZip.Pack` is declared as a submenu (`SubCommands` is present and empty). An earlier
+/// release wrote the same verb as a plain command, and an upgrade leaves that `command` child
+/// behind: Explorer then has both a command and a submenu for one verb and may run the old
+/// command instead of showing the format list. The profile owns this key, so the artifact is
+/// removed rather than reported.
+fn is_submenu_artifact(subkey: &str) -> bool {
+    fold_name(subkey) == "command"
+}
+
+/// What one owned key must contain: its declared value names and the child keys that other
+/// declared keys create beneath it. Anything else is outside the profile.
+struct DeclaredKeyFootprint {
+    key: String,
+    values: BTreeSet<String>,
+    children: BTreeSet<String>,
+}
+
+/// What one owned key currently contains on the host.
+#[derive(serde::Deserialize)]
+struct ObservedKeyFootprint {
+    key: String,
+    names: Vec<String>,
+    subkeys: Vec<String>,
 }
 
 impl RegistryProfile {
@@ -361,7 +418,9 @@ impl RegistryProfile {
         reg
     }
 
-    /// A JSON list of every declared key/value and shared value that must be present.
+    /// A JSON list of every declared key/value and shared value that must be present, plus the
+    /// value names each owned key is allowed to carry. A value outside that list is a leftover
+    /// from an earlier release and fails verification.
     fn build_verify_plan(&self) -> serde_json::Value {
         let keys: Vec<serde_json::Value> = self
             .keys
@@ -369,6 +428,7 @@ impl RegistryProfile {
             .map(|spec| {
                 serde_json::json!({
                     "key": spec.key,
+                    "allowed_values": spec.values.iter().map(|(name, _)| name).collect::<Vec<_>>(),
                     "values": spec.values.iter().map(|(name, val)| match val {
                         RegValue::Sz(s) => serde_json::json!({
                             "name": name, "kind": "SZ", "value": s
@@ -432,6 +492,14 @@ foreach ($spec in $plan.keys) {
         $r = Test-RegValue $prop $v.name $v.kind $v.value
         if ($null -ne $r) {
             Write-Output ("FAIL:" + $r + ":" + $spec.key)
+            exit 0
+        }
+    }
+    if ($null -ne $prop) {
+        $allowed = @($spec.allowed_values)
+        $stale = @($prop.GetValueNames() | Where-Object { $allowed -notcontains $_ })
+        if ($stale.Count -gt 0) {
+            Write-Output ("FAIL:STALE_VALUE:" + $spec.key + ":" + ($stale -join ','))
             exit 0
         }
     }
@@ -536,7 +604,7 @@ Write-Output "FOREIGN"
         write_temp_json(&plan_path, &serde_json::to_string(&specs)?)?;
         let script = r#"
 param([string]$PlanPath)
-$plan = @(Get-Content -LiteralPath $PlanPath -Raw -Encoding UTF8 | ConvertFrom-Json)
+$plan = Get-Content -LiteralPath $PlanPath -Raw -Encoding UTF8 | ConvertFrom-Json
 $result = @()
 foreach ($spec in $plan) {
     $path = 'Registry::' + $spec.key
@@ -627,6 +695,256 @@ ConvertTo-Json -InputObject @($result) -Depth 5 -Compress
         let _ = fs::remove_file(&temp_reg);
         result
     }
+
+    /// The declared footprint of every key this profile owns: its value names plus the child
+    /// keys that other declared keys create beneath it.
+    fn declared_footprints(&self) -> Vec<DeclaredKeyFootprint> {
+        let mut footprints: Vec<DeclaredKeyFootprint> = self
+            .keys
+            .iter()
+            .map(|spec| DeclaredKeyFootprint {
+                key: spec.key.clone(),
+                values: spec
+                    .values
+                    .iter()
+                    .map(|(name, _)| fold_name(name))
+                    .collect(),
+                children: BTreeSet::new(),
+            })
+            .collect();
+        for footprint in &mut footprints {
+            let prefix = format!("{}\\", footprint.key);
+            for spec in &self.keys {
+                let Some(rest) = spec.key.strip_prefix(&prefix) else {
+                    continue;
+                };
+                if let Some(child) = rest.split('\\').next() {
+                    if !child.is_empty() {
+                        footprint.children.insert(fold_name(child));
+                    }
+                }
+            }
+        }
+        footprints
+    }
+
+    /// Read the current value and child-key names of every owned key. A key that does not
+    /// exist is absent from the result rather than an error.
+    fn observe_footprints(&self) -> Result<Vec<ObservedKeyFootprint>, ShellError> {
+        let keys: Vec<&str> = self.keys.iter().map(|spec| spec.key.as_str()).collect();
+        let plan_path = unique_temp_path("mothzip_owned_", "json");
+        write_temp_json(&plan_path, &serde_json::to_string(&keys)?)?;
+        let script = r#"
+param([string]$PlanPath)
+$plan = Get-Content -LiteralPath $PlanPath -Raw -Encoding UTF8 | ConvertFrom-Json
+$result = @()
+foreach ($keyPath in $plan) {
+    $key = Get-Item -LiteralPath ('Registry::' + [string]$keyPath) -ErrorAction SilentlyContinue
+    if ($null -eq $key) { continue }
+    $result += [PSCustomObject]@{
+        key     = [string]$keyPath
+        names   = @($key.GetValueNames())
+        subkeys = @($key.GetSubKeyNames())
+    }
+}
+ConvertTo-Json -InputObject @($result) -Depth 5 -Compress
+"#;
+        let output = run_powershell_script(script, &[&plan_path.to_string_lossy()]);
+        let _ = fs::remove_file(&plan_path);
+        let observed: Vec<ObservedKeyFootprint> = serde_json::from_str(&output?)?;
+        Ok(observed)
+    }
+
+    /// Remove the values this profile does not declare from the keys it owns, and report the
+    /// undeclared subkeys without touching them. The removal list is derived by comparing the
+    /// profile with the host, so no retired value name is ever hardcoded here.
+    fn purge_stale_values(&self) -> Result<StaleValues, ShellError> {
+        let footprints = self.declared_footprints();
+        let mut removed = Vec::new();
+        let mut removed_subkeys = Vec::new();
+        let mut residual_subkeys = Vec::new();
+        for found in self.observe_footprints()? {
+            let Some(declared) = footprints.iter().find(|declared| declared.key == found.key)
+            else {
+                continue;
+            };
+            for name in found.names {
+                if !declared.values.contains(&fold_name(&name)) {
+                    removed.push(StaleRegistryValue {
+                        key: found.key.clone(),
+                        name,
+                    });
+                }
+            }
+            let declares_submenu = declared.values.contains(&fold_name("SubCommands"));
+            for subkey in found.subkeys {
+                if declared.children.contains(&fold_name(&subkey)) {
+                    continue;
+                }
+                if declares_submenu && is_submenu_artifact(&subkey) {
+                    removed_subkeys.push(format!("{}\\{}", found.key, subkey));
+                    continue;
+                }
+                residual_subkeys.push(format!("{}\\{}", found.key, subkey));
+            }
+        }
+        removed.sort_by(|a, b| {
+            a.key
+                .cmp(&b.key)
+                .then_with(|| fold_name(&a.name).cmp(&fold_name(&b.name)))
+        });
+        residual_subkeys.sort();
+        removed_subkeys.sort();
+
+        if !removed.is_empty() {
+            let temp_reg = unique_temp_path("mothzip_purge_", "reg");
+            write_reg_file(&temp_reg, &value_deletion_reg_content(&removed))?;
+            let result = import_reg_file(&temp_reg);
+            let _ = fs::remove_file(&temp_reg);
+            result?;
+        }
+        if !removed_subkeys.is_empty() {
+            let temp_reg = unique_temp_path("mothzip_purge_key_", "reg");
+            write_reg_file(&temp_reg, &key_deletion_reg_content(&removed_subkeys))?;
+            let result = import_reg_file(&temp_reg);
+            let _ = fs::remove_file(&temp_reg);
+            result?;
+        }
+        Ok(StaleValues {
+            removed,
+            removed_subkeys,
+            residual_subkeys,
+        })
+    }
+}
+
+/// The .reg body that deletes exactly the given value names from their keys.
+/// `.reg` text that deletes whole subkeys (the `command` artifact) inside keys the profile owns.
+fn key_deletion_reg_content(keys: &[String]) -> String {
+    let mut reg = String::from("Windows Registry Editor Version 5.00\r\n\r\n");
+    for key in keys {
+        reg.push_str(&format!("[-{}]\r\n", key));
+    }
+    reg
+}
+
+fn value_deletion_reg_content(stale: &[StaleRegistryValue]) -> String {
+    let mut reg = String::from("Windows Registry Editor Version 5.00\r\n\r\n");
+    let mut current: Option<&str> = None;
+    for entry in stale {
+        if current != Some(entry.key.as_str()) {
+            if current.is_some() {
+                reg.push_str("\r\n");
+            }
+            reg.push_str(&format!("[{}]\r\n", entry.key));
+            current = Some(entry.key.as_str());
+        }
+        let name_part = if entry.name.is_empty() {
+            "@".into()
+        } else {
+            format!("\"{}\"", escape_reg_name(&entry.name))
+        };
+        reg.push_str(&format!("{name_part}=-\r\n"));
+    }
+    reg
+}
+
+/// The two directions of MothZip's registry lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegistrationPhase {
+    /// Write the declared profile, remove the values earlier releases left behind, and retire
+    /// the 1.0.x verbs.
+    Apply,
+    /// Delete the owned keys after an ownership check and retire the 1.0.x verbs.
+    Remove,
+}
+
+/// What one lifecycle phase changed on the host.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RegistrationOutcome {
+    pub removed_keys: Vec<String>,
+    pub removed_values: Vec<StaleRegistryValue>,
+    /// Verb artifacts removed because the profile owns the key but not that child (a `command`
+    /// left under a verb that is now a submenu).
+    pub removed_subkeys: Vec<String>,
+    pub residual_subkeys: Vec<String>,
+    pub removed_legacy_verbs: Vec<String>,
+}
+
+/// The single registry lifecycle entry point. Every CLI path that registers or unregisters
+/// calls this function, so the retired 1.0.x verbs are cleaned exactly once per phase and no
+/// entry point can forget them.
+///
+/// `artifact` optionally materializes the applied keys as a .reg file (portable `register`
+/// reports that file); `Remove` never writes one.
+pub fn run_registration_lifecycle(
+    profile: &RegistryProfile,
+    extensions: &[&str],
+    phase: RegistrationPhase,
+    artifact: Option<&Path>,
+) -> Result<RegistrationOutcome, ShellError> {
+    run_registration_lifecycle_with(profile, extensions, phase, artifact, remove_legacy_verbs)
+}
+
+/// Lifecycle implementation with the verb retirement injected so tests can pin the call path
+/// without deleting anything outside a throwaway key.
+fn run_registration_lifecycle_with<F>(
+    profile: &RegistryProfile,
+    extensions: &[&str],
+    phase: RegistrationPhase,
+    artifact: Option<&Path>,
+    retire_verbs: F,
+) -> Result<RegistrationOutcome, ShellError>
+where
+    F: FnOnce(&[&str]) -> Result<Vec<String>, ShellError>,
+{
+    let mut outcome = RegistrationOutcome::default();
+    match phase {
+        RegistrationPhase::Apply => {
+            if let Some(path) = artifact {
+                write_reg_file(path, &profile.generate_reg_content())?;
+                import_reg_file(path)?;
+            } else {
+                let temp_reg = unique_temp_path("mothzip_apply_", "reg");
+                write_reg_file(&temp_reg, &profile.generate_reg_content())?;
+                let result = import_reg_file(&temp_reg);
+                let _ = fs::remove_file(&temp_reg);
+                result?;
+            }
+            let stale = profile.purge_stale_values()?;
+            outcome.removed_values = stale.removed;
+            outcome.removed_subkeys = stale.removed_subkeys;
+            outcome.residual_subkeys = stale.residual_subkeys;
+        }
+        RegistrationPhase::Remove => {
+            if artifact.is_some() {
+                return Err(ShellError::Validation {
+                    field: "registration lifecycle".into(),
+                    message: "Remove does not write a registration artifact".into(),
+                });
+            }
+            match profile.verify_ownership(&profile.exe_path)? {
+                Ownership::None => {}
+                Ownership::Foreign => return Err(ShellError::SecurityViolation {
+                    path: profile.exe_path.clone(),
+                    reason:
+                        "Registry entries exist but do not belong to the target MothZip executable"
+                            .into(),
+                }),
+                Ownership::Owned => {
+                    let temp_reg = unique_temp_path("mothzip_unreg_", "reg");
+                    write_reg_file(&temp_reg, &profile.generate_unreg_content())?;
+                    let result = import_reg_file(&temp_reg);
+                    let _ = fs::remove_file(&temp_reg);
+                    result?;
+                    outcome.removed_keys =
+                        profile.keys.iter().map(|spec| spec.key.clone()).collect();
+                }
+            }
+        }
+    }
+    outcome.removed_legacy_verbs = retire_verbs(extensions)?;
+    Ok(outcome)
 }
 
 /// Ownership classification of the current registry registration.
@@ -712,27 +1030,9 @@ pub fn unregister_all_keys(
     extensions: &[&str],
 ) -> Result<Vec<String>, ShellError> {
     let profile = RegistryProfile::build(expected_exe, false, extensions);
-
-    match profile.verify_ownership(expected_exe)? {
-        Ownership::None => Ok(Vec::new()),
-        Ownership::Foreign => Err(ShellError::SecurityViolation {
-            path: expected_exe.to_path_buf(),
-            reason: "Registry entries exist but do not belong to the target MothZip executable"
-                .into(),
-        }),
-        Ownership::Owned => {
-            let unreg_content = profile.generate_unreg_content();
-            let temp_reg = unique_temp_path("mothzip_unreg_", "reg");
-            write_reg_file(&temp_reg, &unreg_content)?;
-
-            let result = import_reg_file(&temp_reg);
-            let _ = fs::remove_file(&temp_reg);
-            result?;
-
-            let removed = profile.keys.into_iter().map(|k| k.key).collect();
-            Ok(removed)
-        }
-    }
+    let outcome =
+        run_registration_lifecycle(&profile, extensions, RegistrationPhase::Remove, None)?;
+    Ok(outcome.removed_keys)
 }
 
 #[cfg(test)]
@@ -905,5 +1205,449 @@ mod tests {
         assert!(!unreg.contains("[-HKEY_CURRENT_USER\\Software\\RegisteredApplications]"));
         assert!(unreg
             .contains("[HKEY_CURRENT_USER\\Software\\RegisteredApplications]\r\n\"MothZip\"=-"));
+    }
+
+    /// A throwaway HKCU subtree for lifecycle tests. It never addresses a production key: the
+    /// path is always `HKCU\Software\MothZipTest\<unique>`.
+    struct TempRegistryRoot {
+        path: String,
+    }
+
+    impl TempRegistryRoot {
+        fn new() -> Self {
+            let unique = format!(
+                "{}_{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            );
+            Self {
+                path: format!(r"HKEY_CURRENT_USER\Software\MothZipTest\{unique}"),
+            }
+        }
+
+        fn remove(&self) -> Result<(), ShellError> {
+            let script = r#"
+param([string]$KeyPath)
+Remove-Item -LiteralPath ('Registry::' + $KeyPath) -Recurse -Force -ErrorAction SilentlyContinue
+# Drop the shared test namespace only when this was its last subtree. The non-recursive
+# .NET delete throws while another test still owns a child key, so it can never race.
+try { [Microsoft.Win32.Registry]::CurrentUser.DeleteSubKey('Software\MothZipTest', $false) } catch { }
+"#;
+            run_powershell_script(script, &[&self.path]).map(|_| ())
+        }
+
+        fn assert_absent(&self) -> Result<(), ShellError> {
+            let script = r#"
+param([string]$KeyPath)
+if (Test-Path -LiteralPath ('Registry::' + $KeyPath)) { Write-Output 'PRESENT' }
+"#;
+            let out = run_powershell_script(script, &[&self.path])?;
+            assert!(
+                !out.contains("PRESENT"),
+                "temp registry root was not deleted: {}",
+                self.path
+            );
+            Ok(())
+        }
+    }
+
+    impl Drop for TempRegistryRoot {
+        fn drop(&mut self) {
+            let _ = self.remove();
+        }
+    }
+
+    /// Run a body against a temp root and always delete the root, even if the body panics.
+    fn with_temp_registry_root(body: impl FnOnce(&TempRegistryRoot)) {
+        let root = TempRegistryRoot::new();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(&root)));
+        let cleanup = root.remove();
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
+        cleanup.expect("temp registry root cleanup must succeed");
+        root.assert_absent()
+            .expect("temp registry root must be gone after the test");
+    }
+
+    /// Whether one key exists, read through PowerShell so the check never opens a registry
+    /// handle of its own (the lifecycle writes through regedit).
+    fn reg_key_present(key: &str) -> bool {
+        let script = r#"
+param([string]$KeyPath)
+if (Test-Path -LiteralPath ('Registry::' + $KeyPath)) { Write-Output 'PRESENT' }
+"#;
+        run_powershell_script(script, &[key])
+            .map(|out| out.contains("PRESENT"))
+            .unwrap_or(false)
+    }
+
+    fn import_reg_body(body: &str) -> Result<(), ShellError> {
+        let content = format!("Windows Registry Editor Version 5.00\r\n\r\n{body}");
+        let path = unique_temp_path("mothzip_test_", "reg");
+        write_reg_file(&path, &content)?;
+        let result = import_reg_file(&path);
+        let _ = fs::remove_file(&path);
+        result
+    }
+
+    /// A profile whose keys live under the temp root, so the production lifecycle code runs
+    /// without reading or writing any production key.
+    fn temp_profile(root: &str) -> RegistryProfile {
+        let uninstall = format!("{root}\\Uninstall\\MothZip");
+        RegistryProfile {
+            keys: vec![
+                RegKeySpec {
+                    key: uninstall.clone(),
+                    values: vec![
+                        (
+                            "DisplayName".into(),
+                            RegValue::Sz("MothZip (나방집)".into()),
+                        ),
+                        ("NoModify".into(), RegValue::Dword(1)),
+                    ],
+                },
+                RegKeySpec {
+                    key: format!("{uninstall}\\command"),
+                    values: vec![("".into(), RegValue::Sz("mothzip.exe uninstall".into()))],
+                },
+                RegKeySpec {
+                    key: format!("{root}\\Classes\\MothZip.Archive"),
+                    values: vec![("".into(), RegValue::Sz("MothZip 압축 파일".into()))],
+                },
+            ],
+            shared_values: Vec::new(),
+            is_managed: true,
+            exe_path: PathBuf::from("C:\\Program Files\\MothZip\\mothzip.exe"),
+        }
+    }
+
+    /// An upgrade from the plain-verb layout leaves a `command` child under the verb that is now
+    /// declared as a submenu. Explorer would then hold a command and a submenu for one verb, so the
+    /// artifact has to go; a child the profile cannot prove it owns is only reported.
+    #[test]
+    fn test_purge_retires_the_command_child_of_a_submenu_verb() {
+        with_temp_registry_root(|root| {
+            // The full profile, re-rooted under the temp root: this test needs the declared
+            // cascading verb, which the minimal `temp_profile` does not carry.
+            let mut profile = RegistryProfile::build(
+                Path::new("C:\\Program Files\\MothZip\\mothzip.exe"),
+                true,
+                SUPPORTED_EXTENSIONS,
+            );
+            for spec in &mut profile.keys {
+                spec.key = spec
+                    .key
+                    .replacen("HKEY_CURRENT_USER\\Software", &root.path, 1);
+            }
+            let pack_key = profile
+                .keys
+                .iter()
+                .map(|spec| spec.key.clone())
+                .find(|key| key.ends_with("shell\\MothZip.Pack"))
+                .expect("the cascading verb is declared");
+            let artifact = format!("{}\\command", pack_key);
+            let foreign = format!("{}\\unknown_child", pack_key);
+            let seed = format!(
+                "[{pack_key}]\r\n\
+                 \"SubCommands\"=\"\"\r\n\
+                 \"MUIVerb\"=\"압축하기\"\r\n\r\n\
+                 [{artifact}]\r\n\
+                 @=\"mothzip.exe pack-auto\"\r\n\r\n\
+                 [{foreign}]\r\n\
+                 \"keep\"=\"1\"\r\n"
+            );
+            import_reg_body(&seed).expect("seed the pre-upgrade verb layout");
+            assert!(
+                reg_key_present(&artifact),
+                "the seed must contain the artifact"
+            );
+
+            let outcome = run_registration_lifecycle_with(
+                &profile,
+                SUPPORTED_EXTENSIONS,
+                RegistrationPhase::Apply,
+                None,
+                |_| Ok(Vec::new()),
+            )
+            .expect("apply lifecycle");
+
+            assert_eq!(
+                outcome.removed_subkeys,
+                vec![artifact.clone()],
+                "the command child of a submenu verb is removed and reported"
+            );
+            assert!(!reg_key_present(&artifact), "the artifact must be gone");
+            assert!(reg_key_present(&foreign), "an unowned child is left alone");
+            assert!(
+                outcome
+                    .residual_subkeys
+                    .iter()
+                    .any(|key| key.ends_with("unknown_child")),
+                "and reported as residual"
+            );
+        });
+    }
+
+    /// Upgrade guard: a value the profile no longer declares is removed from the owned key,
+    /// an undeclared subkey is reported but kept, and verification fails while either remains.
+    #[test]
+    fn test_lifecycle_purges_undeclared_values_and_reports_subkeys() {
+        with_temp_registry_root(|root| {
+            let profile = temp_profile(&root.path);
+            let uninstall = format!("{}\\Uninstall\\MothZip", root.path);
+            let progid = format!("{}\\Classes\\MothZip.Archive", root.path);
+            let seed = format!(
+                "[{uninstall}]\r\n\
+                 \"DisplayName\"=\"MothZip (나방집)\"\r\n\
+                 \"NoModify\"=dword:00000001\r\n\
+                 \"HelpLink\"=\"https://github.com/mothzip/mothzip\"\r\n\
+                 \"EstimatedSize\"=dword:00000640\r\n\r\n\
+                 [{uninstall}\\command]\r\n\
+                 @=\"mothzip.exe uninstall\"\r\n\r\n\
+                 [{progid}]\r\n\
+                 @=\"MothZip 압축 파일\"\r\n\r\n\
+                 [{uninstall}\\LeftoverChild]\r\n\
+                 \"Stale\"=\"1\"\r\n"
+            );
+            import_reg_body(&seed).expect("seed temp keys");
+
+            assert!(
+                !profile.verify_registered().expect("verify seeded state"),
+                "undeclared values must fail verification before the sweep"
+            );
+
+            let outcome = run_registration_lifecycle_with(
+                &profile,
+                SUPPORTED_EXTENSIONS,
+                RegistrationPhase::Apply,
+                None,
+                |_| Ok(Vec::new()),
+            )
+            .expect("apply lifecycle");
+
+            assert_eq!(
+                outcome.removed_values,
+                vec![
+                    StaleRegistryValue {
+                        key: uninstall.clone(),
+                        name: "EstimatedSize".into(),
+                    },
+                    StaleRegistryValue {
+                        key: uninstall.clone(),
+                        name: "HelpLink".into(),
+                    },
+                ],
+                "only the undeclared values of the owned key are removed"
+            );
+            assert_eq!(
+                outcome.residual_subkeys,
+                vec![format!("{uninstall}\\LeftoverChild")],
+                "undeclared subkeys are reported for the handoff"
+            );
+            assert!(
+                profile.verify_registered().expect("verify swept state"),
+                "the swept key must pass verification"
+            );
+
+            let script = r#"
+param([string]$KeyPath)
+if (Test-Path -LiteralPath ('Registry::' + $KeyPath)) { Write-Output 'PRESENT' }
+"#;
+            let child = format!("{uninstall}\\LeftoverChild");
+            let out = run_powershell_script(script, &[&child]).expect("probe leftover subkey");
+            assert!(
+                out.contains("PRESENT"),
+                "undeclared subkeys are reported, never deleted"
+            );
+        });
+    }
+
+    /// `snapshot` must read every declared value of every owned key and `restore` must put them
+    /// back. PowerShell 5.1 does not enumerate a JSON array through `@(... | ConvertFrom-Json)`,
+    /// which silently produced entries with no key and no value.
+    #[test]
+    fn test_snapshot_round_trips_declared_values() {
+        with_temp_registry_root(|root| {
+            let profile = temp_profile(&root.path);
+            let reg = unique_temp_path("mothzip_test_", "reg");
+            write_reg_file(&reg, &profile.generate_reg_content()).expect("write profile");
+            import_reg_file(&reg).expect("apply profile");
+            let _ = fs::remove_file(&reg);
+
+            let snapshot = profile.snapshot().expect("snapshot declared values");
+            let declared: usize = profile.keys.iter().map(|spec| spec.values.len()).sum();
+            assert_eq!(snapshot.entries.len(), declared);
+            assert!(
+                snapshot
+                    .entries
+                    .iter()
+                    .all(|entry| entry.key_existed && entry.value.is_some()),
+                "every declared value must be captured: {snapshot:?}"
+            );
+
+            let uninstall = format!("{}\\Uninstall\\MothZip", root.path);
+            import_reg_body(&format!(
+                "[{uninstall}]\r\n\"DisplayName\"=\"changed\"\r\n\"NoModify\"=-\r\n"
+            ))
+            .expect("mutate declared values");
+            assert!(
+                !profile.verify_registered().expect("verify mutated"),
+                "the mutated key must not verify"
+            );
+
+            profile.restore(&snapshot).expect("restore snapshot");
+            assert!(
+                profile.verify_registered().expect("verify restored"),
+                "restore must return the captured declared values"
+            );
+        });
+    }
+
+    /// Portable `register` shares the install lifecycle, so the phase retires the 1.0.x verbs
+    /// through the injected cleanup exactly once, with the profile's extension set.
+    #[test]
+    fn test_apply_lifecycle_retires_legacy_verbs_once() {
+        with_temp_registry_root(|root| {
+            let profile = temp_profile(&root.path);
+            let mut calls: Vec<Vec<String>> = Vec::new();
+            let outcome = run_registration_lifecycle_with(
+                &profile,
+                SUPPORTED_EXTENSIONS,
+                RegistrationPhase::Apply,
+                None,
+                |extensions| {
+                    calls.push(extensions.iter().map(|ext| (*ext).to_string()).collect());
+                    Ok(legacy_verb_keys(extensions))
+                },
+            )
+            .expect("apply lifecycle");
+
+            let expected: Vec<String> = SUPPORTED_EXTENSIONS
+                .iter()
+                .map(|ext| (*ext).to_string())
+                .collect();
+            assert_eq!(calls, vec![expected], "cleaned exactly once per phase");
+            assert_eq!(
+                outcome.removed_legacy_verbs,
+                legacy_verb_keys(SUPPORTED_EXTENSIONS)
+            );
+
+            let script = r#"
+param([string]$KeyPath)
+if (Test-Path -LiteralPath ('Registry::' + $KeyPath)) { Write-Output 'PRESENT' }
+"#;
+            let out =
+                run_powershell_script(script, &[&format!("{}\\Uninstall\\MothZip", root.path)])
+                    .expect("probe applied key");
+            assert!(
+                out.contains("PRESENT"),
+                "the apply phase must write the declared profile"
+            );
+        });
+    }
+
+    /// The installer must keep one funnel: it may not retire verbs itself, and install/register
+    /// must both call the shared lifecycle while uninstall/unregister share the removal path.
+    #[test]
+    fn test_installer_uses_the_single_registration_lifecycle() {
+        let installer = include_str!("installer.rs");
+        assert!(
+            !installer.contains("remove_legacy_verbs"),
+            "installer.rs must clean retired verbs only through the registry lifecycle"
+        );
+        assert_eq!(
+            installer.matches("run_registration_lifecycle(").count(),
+            2,
+            "install and portable register must both call the shared lifecycle"
+        );
+        assert_eq!(
+            installer.matches("unregister_all_keys(").count(),
+            2,
+            "uninstall and unregister must both use the shared removal path"
+        );
+    }
+
+    /// The retired-verb deletion is bounded to the owned `MothZip.Unpack*` verb subtrees.
+    #[test]
+    fn test_legacy_verb_deletion_stays_inside_owned_subtrees() {
+        let content = legacy_verb_deletion_reg_content(SUPPORTED_EXTENSIONS);
+        let deleted: Vec<&str> = content
+            .lines()
+            .filter(|line| line.starts_with("[-"))
+            .collect();
+        assert_eq!(deleted.len(), legacy_verb_keys(SUPPORTED_EXTENSIONS).len());
+        for line in deleted {
+            assert!(
+                line.starts_with("[-HKEY_CURRENT_USER\\Software\\Classes\\"),
+                "deletion escaped the Classes subtree: {line}"
+            );
+            assert!(
+                line.contains("\\shell\\MothZip.Unpack"),
+                "deletion escaped the owned verb subtree: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_value_deletion_content_names_only_the_given_values() {
+        let stale = vec![
+            StaleRegistryValue {
+                key: "HKEY_CURRENT_USER\\Software\\Example\\App".into(),
+                name: "HelpLink".into(),
+            },
+            StaleRegistryValue {
+                key: "HKEY_CURRENT_USER\\Software\\Example\\App".into(),
+                name: "EstimatedSize".into(),
+            },
+            StaleRegistryValue {
+                key: "HKEY_CURRENT_USER\\Software\\Example\\App\\Child".into(),
+                name: String::new(),
+            },
+        ];
+        let reg = value_deletion_reg_content(&stale);
+        assert_eq!(
+            reg,
+            "Windows Registry Editor Version 5.00\r\n\r\n\
+             [HKEY_CURRENT_USER\\Software\\Example\\App]\r\n\
+             \"HelpLink\"=-\r\n\
+             \"EstimatedSize\"=-\r\n\r\n\
+             [HKEY_CURRENT_USER\\Software\\Example\\App\\Child]\r\n\
+             @=-\r\n"
+        );
+    }
+
+    /// Verification must know which value names the profile allows, so a leftover value can
+    /// never satisfy the check again.
+    #[test]
+    fn test_verify_plan_allows_only_declared_value_names() {
+        let profile = RegistryProfile::build(
+            Path::new("C:\\Program Files\\MothZip\\mothzip.exe"),
+            true,
+            SUPPORTED_EXTENSIONS,
+        );
+        let plan = profile.build_verify_plan();
+        let uninstall = plan["keys"]
+            .as_array()
+            .expect("keys array")
+            .iter()
+            .find(|spec| {
+                spec["key"]
+                    .as_str()
+                    .is_some_and(|key| key.ends_with("Uninstall\\MothZip"))
+            })
+            .expect("uninstall key planned");
+        let allowed: Vec<&str> = uninstall["allowed_values"]
+            .as_array()
+            .expect("allowed_values array")
+            .iter()
+            .filter_map(|name| name.as_str())
+            .collect();
+        assert!(allowed.contains(&"DisplayName"));
+        assert!(!allowed.contains(&"HelpLink"));
+        assert!(!allowed.contains(&"EstimatedSize"));
     }
 }

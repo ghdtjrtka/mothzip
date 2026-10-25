@@ -16,7 +16,12 @@ Measured per case
   ``푸는 중…`` text that shows the work left the UI thread;
 * extraction: every extracted file hashed with SHA-256 and compared with the fixture, plus the
   zero-byte file, the nested folder and the Korean file name;
-* lifetime: ``WM_CLOSE`` must end the process with exit code 0.
+* lifetime: ``WM_CLOSE`` must end the process with exit code 0;
+* close-while-busy (``zip-busy-close``): ``MOTHZIP_UI_TEST_CLOSE_WHILE_BUSY=1`` makes the window
+  request a close the moment its extraction worker starts. The refusal must appear on the status
+  line (``작업 중… 완료 후 닫을 수 있습니다 [close-refused-while-busy]``), the process must stay
+  alive, the extraction must still commit every file, and the normal close must still exit 0.
+  A 32 MiB stored fixture keeps the worker running long enough to observe the refusal.
 
 Deliberately out of scope (reported as unverified, never counted as a pass)
 -------------------------------------------------------------------------
@@ -90,6 +95,22 @@ TITLE_SUFFIX = "MothZip"
 # The extraction target the window must use instead of the folder picker. Test-only hook; the
 # shipped behaviour is always `rfd::FileDialog::pick_folder`.
 TEST_DIR_ENV = "MOTHZIP_UI_TEST_EXTRACT_DIR"
+
+# Test-only hook: the window requests a close the moment a worker starts, so the refusal path is
+# observed deterministically instead of racing a fast extraction.
+CLOSE_HOOK_ENV = "MOTHZIP_UI_TEST_CLOSE_WHILE_BUSY"
+
+# The refusal text and the note the window adds while that hook is active.
+BUSY_CLOSE_REFUSAL = "작업 중… 완료 후 닫을 수 있습니다"
+BUSY_CLOSE_NOTE = "close-refused-while-busy"
+
+# Staging directories the extraction creates inside the destination and removes on commit.
+STAGE_PREFIX = ".mothzip_stage_"
+
+# A stored (uncompressed) 32 MiB fixture: big enough that the worker keeps running while the
+# harness polls the status line, small enough to build and extract in a couple of seconds.
+LARGE_CHUNKS = 8
+LARGE_CHUNK_BYTES = 4 * 1024 * 1024
 
 # Authored layout of the window at 96 DPI, mirrored from src/ui/mod.rs so the measurement is a
 # comparison rather than an assumption.
@@ -280,9 +301,29 @@ def expected_inventory(fixtures: Path) -> tuple[list[str], dict[str, str]]:
     return entries, hashes
 
 
-def run_pack(binary: Path, fixtures: Path, archive: Path) -> dict:
+def build_large_tree(fixtures: Path) -> tuple[list[str], dict[str, str]]:
+    """A stored 32 MiB fixture tree so one extraction keeps the worker busy while we poll."""
+    entries = ["large/"]
+    hashes: dict[str, str] = {}
+    block = bytes(range(256)) * 4096  # 1 MiB, deterministic across runs
+    for index in range(LARGE_CHUNKS):
+        relative = f"large/chunk{index:02d}.bin"
+        target = fixtures / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        rotated = block[index * 4096 :] + block[: index * 4096]
+        payload = (rotated * (LARGE_CHUNK_BYTES // len(rotated) + 1))[:LARGE_CHUNK_BYTES]
+        target.write_bytes(payload)
+        entries.append(relative)
+        hashes[relative] = hashlib.sha256(payload).hexdigest()
+    return entries, hashes
+
+
+def run_pack(binary: Path, fixtures: Path, archive: Path, source: str, level: int | None = None) -> dict:
+    command = [str(binary), "pack", str(archive), source]
+    if level is not None:
+        command += ["-l", str(level)]
     completed = subprocess.run(
-        [str(binary), "pack", str(archive), "src"],
+        command,
         cwd=str(fixtures),
         capture_output=True,
         text=True,
@@ -291,7 +332,7 @@ def run_pack(binary: Path, fixtures: Path, archive: Path) -> dict:
         timeout=180,
     )
     return {
-        "command": f"{binary} pack {archive.name} src",
+        "command": " ".join(command),
         "returncode": completed.returncode,
         "stdout": completed.stdout.strip(),
         "stderr": completed.stderr.strip(),
@@ -308,6 +349,7 @@ class Case:
     selected_only: bool = False
     expect_load_error: bool = False
     keyboard: bool = False
+    busy_close: bool = False
 
 
 @dataclass
@@ -349,6 +391,8 @@ class Harness:
         self.pack_log: dict[str, dict] = {}
         self.expected_entries: list[str] = []
         self.expected_files: dict[str, str] = {}
+        self.large_entries: list[str] = []
+        self.large_files: dict[str, str] = {}
 
     # -- fixture setup ------------------------------------------------------------------------
 
@@ -361,10 +405,24 @@ class Harness:
             archive = self.fixtures / archive_name
             if archive.exists():
                 archive.unlink()
-            result = run_pack(self.binary, self.fixtures, archive)
+            result = run_pack(self.binary, self.fixtures, archive, "src")
             self.pack_log[archive_name] = result
             if result["returncode"] != 0 or not archive.is_file():
                 raise RuntimeError(f"pack failed for {archive_name}: {result}")
+        # The close-while-busy case needs a job that outlives the harness's first status poll.
+        # Stored (level 0) keeps the fixture at ~32 MiB so the worker runs for a measurable time.
+        self.large_entries, self.large_files = build_large_tree(self.fixtures)
+        large_archive = self.fixtures / "large.zip"
+        if large_archive.exists():
+            large_archive.unlink()
+        result = run_pack(self.binary, self.fixtures, large_archive, "large", level=0)
+        self.pack_log["large.zip"] = result
+        if result["returncode"] != 0 or not large_archive.is_file():
+            raise RuntimeError(f"pack failed for large.zip: {result}")
+        if large_archive.stat().st_size < 20 * 1024 * 1024:
+            raise RuntimeError(
+                f"large.zip is not stored: {large_archive.stat().st_size} bytes, expected > 20 MiB"
+            )
         # A truncated ZIP keeps the local-file magic, so the format is recognised and the central
         # directory read is what fails: exactly the "corrupt archive" path the window must survive.
         source = (self.fixtures / "sample.zip").read_bytes()
@@ -491,9 +549,13 @@ class Harness:
         run.measurements["archive_bytes"] = archive.stat().st_size
         run.measurements["archive_sha256"] = sha256_file(archive)
         run.measurements["extract_dir"] = str(out_dir)
+        expected_entries = self.large_entries if case.busy_close else self.expected_entries
+        expected_files = self.large_files if case.busy_close else self.expected_files
 
         environment = dict(os.environ)
         environment[TEST_DIR_ENV] = str(out_dir)
+        if case.busy_close:
+            environment[CLOSE_HOOK_ENV] = "1"
         stdout_path = work_dir / "stdout.txt"
         stderr_path = work_dir / "stderr.txt"
         process: subprocess.Popen | None = None
@@ -539,14 +601,14 @@ class Harness:
 
             rows = self.win32.send(list_view, LVM_GETITEMCOUNT)
             run.measurements["lvm_item_count"] = rows
-            run.measurements["expected_entry_count"] = len(self.expected_entries)
+            run.measurements["expected_entry_count"] = len(expected_entries)
             if case.expect_load_error:
                 run.check("list.empty_after_load_error", rows == 0, rows)
             else:
                 run.check(
                     "list.item_count_equals_catalog",
-                    rows == len(self.expected_entries),
-                    {"measured": rows, "expected": len(self.expected_entries)},
+                    rows == len(expected_entries),
+                    {"measured": rows, "expected": len(expected_entries)},
                 )
 
             header = self.win32.send(list_view, LVM_GETHEADER)
@@ -566,7 +628,7 @@ class Harness:
             else:
                 run.check(
                     "status.reports_entry_count",
-                    initial_status == f"{len(self.expected_entries)}개 항목",
+                    initial_status == f"{len(expected_entries)}개 항목",
                     initial_status,
                 )
 
@@ -594,13 +656,29 @@ class Harness:
                     all(state is True for state in action_states.values()),
                     action_states,
                 )
+                self.run_load_failure_actions(
+                    run, process, hwnd, list_view, status, labels, out_dir
+                )
             else:
                 run.check(
                     "menu.actions_enabled_after_load",
                     all(state is False for state in action_states.values()),
                     action_states,
                 )
-                self.run_actions(run, hwnd, list_view, status, labels, case, out_dir)
+                if case.busy_close:
+                    self.run_busy_close(
+                        run,
+                        process,
+                        hwnd,
+                        status,
+                        labels,
+                        out_dir,
+                        expected_files,
+                    )
+                else:
+                    self.run_actions(
+                        run, hwnd, list_view, status, labels, case, out_dir, expected_files
+                    )
 
             if case.keyboard:
                 # Esc is the accelerator for 닫기, so the same window command is exercised.
@@ -628,6 +706,146 @@ class Harness:
                 process.wait(timeout=10)
         return run
 
+    def run_load_failure_actions(
+        self,
+        run: CaseRun,
+        process: subprocess.Popen,
+        hwnd: int,
+        list_view: int,
+        status: int | None,
+        labels: dict[str, dict],
+        out_dir: Path,
+    ) -> None:
+        """A catalog that failed to load must ignore every route to an action.
+
+        Enter is the accelerator for 압축 풀기, and the three menu command ids are what a click or
+        any other accelerator sends; all of them are posted to the real window. A started job would
+        change the status line, and an extraction would create the destination, so both are
+        measured instead of assumed.
+        """
+        before = self.status_text(status)
+        run.measurements["status_before_ignored_actions"] = before
+        run.check(
+            "load_failure.starts_from_load_error", "읽지 못했" in before, before
+        )
+        if not self.press(hwnd, VK_RETURN, SCAN_RETURN):
+            raise RuntimeError("PostMessageW(WM_KEYDOWN VK_RETURN) failed")
+        for label in (ACTION_EXTRACT_ALL, ACTION_EXTRACT_SELECTED, ACTION_TEST):
+            self.trigger(hwnd, labels[label]["id"])
+        time.sleep(0.4)
+        after = self.status_text(status)
+        run.measurements["status_after_ignored_actions"] = after
+        run.check(
+            "load_failure.status_unchanged",
+            after == before,
+            {"before": before, "after": after},
+        )
+        run.check("load_failure.no_extraction_output", not out_dir.exists(), str(out_dir))
+        run.check("load_failure.process_alive", process.poll() is None, process.poll())
+        # The list still holds no rows, so a selected extraction has nothing to resolve either.
+        run.check(
+            "load_failure.list_still_empty",
+            self.win32.send(list_view, LVM_GETITEMCOUNT) == 0,
+            self.win32.send(list_view, LVM_GETITEMCOUNT),
+        )
+
+    def run_busy_close(
+        self,
+        run: CaseRun,
+        process: subprocess.Popen,
+        hwnd: int,
+        status: int | None,
+        labels: dict[str, dict],
+        out_dir: Path,
+        expected_files: dict[str, str],
+    ) -> None:
+        """Start one extraction and measure the refusal of a close request while it runs.
+
+        The window's test hook sends WM_CLOSE synchronously as soon as the worker starts, so the
+        refusal does not race the job. The status line is polled for the hook's note; at that moment
+        the process must still be alive. The job then has to commit every file, and the case closes
+        normally, which also proves the close path still exits 0 once the worker is gone.
+        """
+        before = self.status_text(status)
+        run.measurements["status_before_extract"] = before
+        run.check("busy_close.ready_before_action", before.endswith("개 항목"), before)
+        self.trigger(hwnd, labels[ACTION_EXTRACT_ALL]["id"])
+        run.measurements["extract_trigger"] = "menu-command-with-close-hook"
+
+        marker_status = None
+        marker_while_running = False
+        alive_at_marker = None
+        last = before
+        deadline = time.monotonic() + self.timeout
+        while time.monotonic() < deadline:
+            current = self.status_text(status)
+            if current != last:
+                last = current
+                run.transitions.append(current)
+            if marker_status is None and BUSY_CLOSE_NOTE in current:
+                marker_status = current
+                alive_at_marker = process.poll() is None
+                marker_while_running = (
+                    "압축 풀기 완료" not in current and "압축 풀기 실패" not in current
+                )
+            if "압축 풀기 완료" in current or "압축 풀기 실패" in current:
+                break
+            if process.poll() is not None:
+                break
+            time.sleep(0.005)
+
+        run.measurements["busy_close_refusal_status"] = marker_status
+        run.measurements["busy_close_refusal_seen_while_job_running"] = marker_while_running
+        run.measurements["busy_close_process_alive_at_refusal"] = alive_at_marker
+        run.measurements["status_after_busy_extract"] = last
+
+        run.check(
+            "busy_close.refusal_status_contains_note",
+            marker_status is not None and BUSY_CLOSE_NOTE in marker_status,
+            marker_status,
+        )
+        run.check(
+            "busy_close.process_alive_at_refusal",
+            alive_at_marker is True,
+            {"alive": alive_at_marker, "status": marker_status},
+        )
+        run.check(
+            "busy_close.completion_after_refusal",
+            "압축 풀기 완료" in last,
+            last,
+        )
+        run.check(
+            "busy_close.note_survives_completion",
+            BUSY_CLOSE_NOTE in last,
+            last,
+        )
+        run.check("busy_close.process_alive_before_normal_close", process.poll() is None, process.poll())
+        if not marker_while_running:
+            run.notes.append(
+                "the refusal note was first read from the completion status: the 32 MiB extraction "
+                "finished before the first poll, so the transient busy text was not sampled"
+            )
+
+        extracted = self.compare_extraction(out_dir, run, expected_files)
+        run.check("extract.no_missing_files", not extracted["missing"], extracted["missing"])
+        run.check(
+            "extract.no_unexpected_files", not extracted["unexpected"], extracted["unexpected"]
+        )
+        run.check(
+            "extract.sha256_matches_source",
+            not extracted["sha256_mismatch"],
+            extracted["sha256_mismatch"],
+        )
+        staging = (
+            sorted(path.name for path in out_dir.rglob(f"{STAGE_PREFIX}*"))
+            if out_dir.is_dir()
+            else []
+        )
+        run.check("busy_close.no_staging_residue", not staging, staging)
+        run.measurements["extracted_bytes"] = sum(
+            item["size"] for item in extracted["files"].values()
+        )
+
     def run_actions(
         self,
         run: CaseRun,
@@ -637,6 +855,7 @@ class Harness:
         labels: dict[str, dict],
         case: Case,
         out_dir: Path,
+        expected_files: dict[str, str],
     ) -> None:
         before_test = self.status_text(status)
         self.trigger(hwnd, labels[ACTION_TEST]["id"])
@@ -699,9 +918,9 @@ class Harness:
                 "worker-thread hand-off is evidenced by the completion text only"
             )
 
-        extracted = self.compare_extraction(out_dir, run)
+        extracted = self.compare_extraction(out_dir, run, expected_files)
         if case.selected_only:
-            members = [name for name in self.expected_files if name in extracted["files"]]
+            members = [name for name in expected_files if name in extracted["files"]]
             run.check(
                 "extract.selected_writes_exactly_one_member",
                 len(extracted["files"]) == 1 and len(members) == 1,
@@ -712,7 +931,7 @@ class Harness:
                 run.measurements["selected_member"] = member
                 run.check(
                     "extract.selected_member_matches_source",
-                    self.expected_files.get(member) == extracted["files"][member]["sha256"],
+                    expected_files.get(member) == extracted["files"][member]["sha256"],
                     member,
                 )
         else:
@@ -732,7 +951,7 @@ class Harness:
                 sorted(extracted["files"]),
             )
 
-    def compare_extraction(self, out_dir: Path, run: CaseRun) -> dict:
+    def compare_extraction(self, out_dir: Path, run: CaseRun, expected_files: dict[str, str]) -> dict:
         files: dict[str, dict] = {}
         if out_dir.exists():
             for path in sorted(out_dir.rglob("*")):
@@ -741,12 +960,12 @@ class Harness:
                         "size": path.stat().st_size,
                         "sha256": sha256_file(path),
                     }
-        missing = sorted(set(self.expected_files) - set(files))
-        unexpected = sorted(set(files) - set(self.expected_files))
+        missing = sorted(set(expected_files) - set(files))
+        unexpected = sorted(set(files) - set(expected_files))
         mismatched = {
-            name: {"expected": self.expected_files[name], "actual": files[name]["sha256"]}
-            for name in self.expected_files
-            if name in files and files[name]["sha256"] != self.expected_files[name]
+            name: {"expected": expected_files[name], "actual": files[name]["sha256"]}
+            for name in expected_files
+            if name in files and files[name]["sha256"] != expected_files[name]
         }
         run.measurements["selected_files" if run.case.selected_only else "extracted_files"] = files
         return {
@@ -798,6 +1017,7 @@ def main(argv: list[str]) -> int:
         Case(name="zip-selected", archive_name="sample.zip", selected_only=True),
         Case(name="zip-enter-key", archive_name="sample.zip", keyboard=True),
         Case(name="zip-corrupt", archive_name="corrupt.zip", expect_load_error=True),
+        Case(name="zip-busy-close", archive_name="large.zip", busy_close=True),
     ]
     if args.cases:
         known = {case.name for case in cases}
@@ -818,7 +1038,9 @@ def main(argv: list[str]) -> int:
 
     results: list[dict] = []
     if setup_error is None:
+        large_size = (harness.fixtures / "large.zip").stat().st_size
         print(f"fixtures       : {len(harness.expected_entries)} entries, {len(harness.expected_files)} files")
+        print(f"busy-close     : {len(harness.large_entries)} entries, large.zip = {large_size} bytes")
         for case in cases:
             run = harness.run_case(case)
             results.append(run.as_dict())
@@ -848,6 +1070,8 @@ def main(argv: list[str]) -> int:
         "python": sys.version.split()[0],
         "expected_entries": harness.expected_entries,
         "expected_files": harness.expected_files,
+        "busy_close_expected_entries": harness.large_entries,
+        "busy_close_expected_files": harness.large_files,
         "pack_log": harness.pack_log,
         "unverified": [
             "interactive folder picker (MOTHZIP_UI_TEST_EXTRACT_DIR replaces it here)",
@@ -855,6 +1079,7 @@ def main(argv: list[str]) -> int:
             "encrypted and budget-exceeded archives are not driven through the window",
             "high DPI layouts are only measured at this host's DPI",
             "two windows open at the same time",
+            "the busy-close fixture is stored (level 0); compressed archive timing is not measured",
         ],
         "summary": summary,
         "cases": results,

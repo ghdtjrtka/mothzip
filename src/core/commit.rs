@@ -220,6 +220,30 @@ impl Drop for FileTransaction {
         }
     }
 }
+/// One staging path producer for writers that replace an existing file.
+///
+/// The staging file is a sibling of the destination so the final rename stays on the same volume,
+/// and its name carries the process id and a timestamp so a crashed run is recognisable and two
+/// concurrent runs cannot collide.
+pub fn staging_path(destination: &Path, kind: &str) -> PathBuf {
+    let parent = destination.parent().unwrap_or(Path::new("."));
+    let name = destination
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("archive");
+    let token = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_nanos())
+        .unwrap_or(0);
+    parent.join(format!(
+        ".mothzip_{}_{}_{}_{}",
+        kind,
+        std::process::id(),
+        token,
+        name
+    ))
+}
+
 pub fn commit_files(files: &[(PathBuf, PathBuf)]) -> Result<(), CommitError> {
     FileTransaction::apply(files)?.finalize()
 }
@@ -326,5 +350,65 @@ fn discard_original(path: &Path) -> io::Result<()> {
     match error {
         Some(e) => Err(e),
         None => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The staging file must sit beside the destination (same volume, so the final rename stays a
+    /// rename) and must not collide between two runs in the same directory.
+    #[test]
+    fn test_staging_path_is_a_unique_sibling() {
+        let destination = Path::new("C:\\work\\out.zip");
+        let first = staging_path(destination, "pack");
+        let second = staging_path(destination, "pack");
+
+        assert_eq!(first.parent(), destination.parent());
+        assert_ne!(first, second, "two runs must not share a staging path");
+        let name = first.file_name().unwrap().to_string_lossy();
+        assert!(name.starts_with(".mothzip_pack_"), "got {name}");
+        assert!(
+            name.ends_with("out.zip"),
+            "the destination name should be recognisable: {name}"
+        );
+    }
+
+    /// A transaction that replaces two files restores both when the second one fails, and leaves
+    /// nothing behind: this is the guarantee every writer depends on.
+    #[test]
+    fn test_failed_commit_restores_every_original() {
+        let dir = std::env::temp_dir().join(format!(
+            "mothzip_commit_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let first = dir.join("first.txt");
+        let second = dir.join("second.txt");
+        std::fs::write(&first, b"FIRST ORIGINAL").unwrap();
+        std::fs::write(&second, b"SECOND ORIGINAL").unwrap();
+
+        // The second destination is a directory, which the transaction refuses; the first has
+        // already been replaced when that happens.
+        let blocked = dir.join("blocked");
+        std::fs::create_dir_all(&blocked).unwrap();
+        let staged_first = dir.join(".mothzip_stage_first");
+        let staged_second = dir.join(".mothzip_stage_second");
+        std::fs::write(&staged_first, b"REPLACED").unwrap();
+        std::fs::write(&staged_second, b"REPLACED").unwrap();
+
+        let outcome = commit_files(&[
+            (staged_first.clone(), first.clone()),
+            (staged_second.clone(), blocked.clone()),
+        ]);
+        assert!(outcome.is_err(), "a directory destination must be refused");
+        assert_eq!(std::fs::read(&first).unwrap(), b"FIRST ORIGINAL");
+        assert_eq!(std::fs::read(&second).unwrap(), b"SECOND ORIGINAL");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

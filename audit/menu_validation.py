@@ -218,6 +218,13 @@ for root_key, label in (("Software\\Classes\\*", "file"), ("Software\\Classes\\D
         children == {f"MothZip.Pack.{verb}" for verb, _, _ in PACK_FORMATS},
         f"children={sorted(children)}",
     )
+    # A submenu verb must not also carry a command: an upgrade from the plain-verb layout left one
+    # behind, and Explorer then has both a command and a submenu for one entry.
+    record(
+        f"{label}:submenu-has-no-command",
+        "command" not in {name.lower() for name in subkey_names(submenu_parent)},
+        f"children={sorted(subkey_names(submenu_parent))}",
+    )
 
     for verb, suffix, extension in PACK_FORMATS:
         fmt_dir = workdir / f"{label}-fmt-{suffix.replace('.', '_')}"

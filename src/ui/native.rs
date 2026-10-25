@@ -5,6 +5,8 @@
 //! (the font), so the acquire/release pair lives together here.
 
 use std::ffi::c_void;
+use std::fs::Metadata;
+use std::os::windows::fs::MetadataExt;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -87,6 +89,18 @@ pub fn destroy_font(font: HFONT) {
     }
 }
 
+/// `FILE_ATTRIBUTE_REPARSE_POINT` marks a symlink, a junction or another filesystem redirect.
+/// `windows-sys` exposes the constant only behind the storage feature this crate does not enable,
+/// so the documented value lives here next to the probe that uses it.
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0400;
+
+/// Whether `metadata` describes a reparse point. Writing "into" one would put the files somewhere
+/// other than the path says, so callers that trust a path must reject it before using it as a
+/// destination.
+pub fn is_reparse_point(metadata: &Metadata) -> bool {
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
 /// Convert a timestamp to the local wall clock the user compares against Explorer.
 pub fn local_system_time(time: SystemTime) -> Option<SYSTEMTIME> {
     /// 100 ns ticks, the FILETIME unit.
@@ -152,5 +166,14 @@ mod tests {
         let stamp = stamp.expect("the Unix epoch is representable as local time");
         assert!(stamp.wYear >= 2023 && stamp.wYear <= 2024);
         assert!((1..=12).contains(&stamp.wMonth));
+    }
+
+    #[test]
+    fn a_plain_directory_is_not_a_reparse_point() {
+        let dir = std::env::temp_dir().join(format!("mothzip-native-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create the probe directory");
+        let metadata = std::fs::symlink_metadata(&dir).expect("read the probe directory");
+        assert!(!is_reparse_point(&metadata));
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

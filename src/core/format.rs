@@ -418,7 +418,6 @@ pub fn days_from_civil(y: i64, m: u64, d: u64) -> i64 {
 }
 
 /// Convert days since Unix epoch to civil date (year, month, day) (Howard Hinnant algorithm)
-#[allow(dead_code)]
 pub fn civil_from_days(days: i64) -> (i32, u8, u8) {
     let z = days + 719468;
     let era = if z >= 0 { z } else { z - 146096 } / 146097;

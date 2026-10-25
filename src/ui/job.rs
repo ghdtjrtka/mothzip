@@ -1,26 +1,29 @@
 //! Background extraction and integrity checks.
 //!
 //! The window stays responsive because every filesystem-heavy producer runs here, on one worker
-//! thread, and reports back with a single posted message. The threads share no state: the outcome
-//! crosses the boundary as one boxed value that the UI thread takes ownership of.
+//! thread, and reports back when it finishes. The threads share no state: the outcome crosses the
+//! boundary through a channel, and the UI thread can take it even when the window is destroyed
+//! before it dispatches the posted notification. The handle lets a closing window wait for the
+//! worker's commit or cleanup instead of abandoning it mid-write.
 
 use std::path::PathBuf;
-use std::thread;
+use std::sync::mpsc::{self, Receiver};
+use std::thread::{self, JoinHandle};
 
-use windows_sys::Win32::Foundation::{HWND, LPARAM};
+use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
 
 use crate::core::extract::{extract_archive_with_options, ExtractionOptions};
 use crate::core::inspect::test_archive_integrity;
 
-/// Posted by a worker when its job finished; `lparam` carries one boxed [`JobOutcome`].
+/// Posted by a worker when its job finished; the outcome itself comes through the job's channel.
 pub const WM_APP_JOB_DONE: u32 = WM_APP + 1;
 
 /// The worker thread's name, so a hang is identifiable in a debugger or a dump.
 const WORKER_NAME: &str = "mothzip-ui-job";
 
 /// What the user asked the worker to do.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum JobKind {
     ExtractAll,
     ExtractSelected,
@@ -65,6 +68,13 @@ pub struct JobOutcome {
     pub result: JobResult,
 }
 
+impl JobOutcome {
+    /// Whether the producer reported an error; the window turns this into its exit code.
+    pub fn failed(&self) -> bool {
+        matches!(self.result, JobResult::Failed(_))
+    }
+}
+
 /// Everything the worker needs; nothing in it borrows the window.
 pub struct JobRequest {
     pub kind: JobKind,
@@ -77,30 +87,51 @@ pub struct JobRequest {
     pub members: Vec<String>,
 }
 
-/// Run `request` on a worker thread and post its outcome to `window`.
+/// A running worker and the channel through which its single outcome comes back.
+pub struct Job {
+    handle: JoinHandle<()>,
+    outcomes: Receiver<JobOutcome>,
+}
+
+impl Job {
+    /// Wait for the worker to finish and take the outcome it reported.
+    ///
+    /// `None` means the worker ended without reporting (it panicked), which the caller counts as a
+    /// failed job. Waiting is what lets a closing window finish the worker's commit or cleanup
+    /// instead of abandoning it mid-write.
+    pub fn finish(self) -> Option<JobOutcome> {
+        let joined = self.handle.join();
+        if joined.is_err() {
+            return None;
+        }
+        self.outcomes.try_recv().ok()
+    }
+}
+
+/// Run `request` on a worker thread and return the handle that can wait for it.
 ///
 /// A failure to start the thread is returned so the caller can report it; the thread itself never
-/// fails to report, because the outcome is posted even when the producer errors.
-pub fn spawn(window: HWND, request: JobRequest) -> std::io::Result<()> {
+/// fails to report, because the outcome is sent even when the producer errors.
+pub fn spawn(window: HWND, request: JobRequest) -> std::io::Result<Job> {
     let target = window as isize;
-    thread::Builder::new()
+    let (sender, outcomes) = mpsc::channel();
+    let handle = thread::Builder::new()
         .name(WORKER_NAME.to_string())
         .spawn(move || {
             let outcome = JobOutcome {
                 kind: request.kind,
                 result: run(&request),
             };
-            let payload = Box::into_raw(Box::new(outcome));
-            // SAFETY: `payload` was just allocated for this message; if the post fails (the
-            // window is already gone) we still own it and free it below instead of leaking.
-            let posted =
-                unsafe { PostMessageW(target as HWND, WM_APP_JOB_DONE, 0, payload as LPARAM) };
-            if posted == 0 {
-                // SAFETY: `payload` was not transferred and is dropped exactly once here.
-                drop(unsafe { Box::from_raw(payload) });
+            // The outcome travels through the channel rather than a message payload: a window that
+            // is destroyed before dispatching WM_APP_JOB_DONE can still take it after joining.
+            let _ = sender.send(outcome);
+            // SAFETY: posting a payload-free notification to the window this job was started for.
+            // A failed post only means the window is gone; the outcome stays in the channel.
+            unsafe {
+                PostMessageW(target as HWND, WM_APP_JOB_DONE, 0, 0);
             }
         })?;
-    Ok(())
+    Ok(Job { handle, outcomes })
 }
 
 fn run(request: &JobRequest) -> JobResult {
@@ -147,5 +178,53 @@ fn test(request: &JobRequest) -> JobResult {
                 .unwrap_or_else(|| "무결성 검사가 통과하지 못했습니다".to_string()),
         ),
         Err(error) => JobResult::Failed(error.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn finish_takes_the_outcome_after_the_worker_exits() {
+        let (sender, outcomes) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            sender
+                .send(JobOutcome {
+                    kind: JobKind::Test,
+                    result: JobResult::Tested { entries: 4 },
+                })
+                .expect("the test keeps the receiver alive");
+        });
+        let outcome = Job { handle, outcomes }
+            .finish()
+            .expect("the worker reported an outcome");
+        assert_eq!(outcome.kind, JobKind::Test);
+        assert!(matches!(outcome.result, JobResult::Tested { entries: 4 }));
+        assert!(!outcome.failed());
+    }
+
+    #[test]
+    fn finish_reports_a_failed_job_as_failure() {
+        let (sender, outcomes) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            sender
+                .send(JobOutcome {
+                    kind: JobKind::ExtractAll,
+                    result: JobResult::Failed("bad archive".to_string()),
+                })
+                .expect("the test keeps the receiver alive");
+        });
+        let outcome = Job { handle, outcomes }
+            .finish()
+            .expect("the worker reported an outcome");
+        assert!(outcome.failed());
+    }
+
+    #[test]
+    fn finish_reports_a_worker_that_died_without_an_outcome_as_missing() {
+        let (_sender, outcomes) = mpsc::channel::<JobOutcome>();
+        let handle = thread::spawn(|| {});
+        assert!(Job { handle, outcomes }.finish().is_none());
     }
 }

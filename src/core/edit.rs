@@ -15,7 +15,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::core::catalog::CatalogEntry;
+use crate::core::catalog::{member_form, member_subtree_suffix, CatalogEntry};
 use crate::core::format::ArchiveFormat;
 use crate::core::pack::{collect_source_tree, SourceTreeItem, SourceTreePolicy};
 
@@ -67,17 +67,10 @@ enum FormatKind {
     SevenZ,
 }
 
-/// Canonical member identity: forward slashes, no leading/trailing slash.
-fn canon(s: &str) -> String {
-    s.replace('\\', "/").trim_matches('/').to_string()
-}
-
-/// Delete/rename boundary match: equality, or a prefix ending at a slash boundary.
-fn matching_boundary(member: &str, pat: &str) -> bool {
-    member == pat
-        || member
-            .strip_prefix(pat)
-            .is_some_and(|rest| rest.starts_with('/'))
+/// Delete/rename boundary match uses the one member-selection rule in the catalog:
+/// the member itself, or a member under the requested directory at a slash boundary.
+fn selects(member: &str, pattern: &str) -> bool {
+    member_subtree_suffix(pattern, member).is_some()
 }
 
 #[derive(Debug, Clone)]
@@ -218,7 +211,7 @@ fn build_plan(
 ) -> Result<Plan, String> {
     let mut map: BTreeMap<String, OrigInfo> = BTreeMap::new();
     for e in catalog {
-        let key = canon(&e.name);
+        let key = member_form(&e.name);
         if map.contains_key(&key) {
             return Err(format!(
                 "original archive contains duplicate member name '{key}'"
@@ -239,15 +232,12 @@ fn build_plan(
     for op in ops {
         if let EditOp::Delete { members } = op {
             for pat_raw in members {
-                let pat = canon(pat_raw);
+                let pat = member_form(pat_raw);
                 if pat.is_empty() {
                     return Err("empty delete member name".to_string());
                 }
-                let matched: Vec<String> = map
-                    .keys()
-                    .filter(|k| matching_boundary(k, &pat))
-                    .cloned()
-                    .collect();
+                let matched: Vec<String> =
+                    map.keys().filter(|k| selects(k, &pat)).cloned().collect();
                 if matched.is_empty() {
                     return Err(format!("member not found in archive: {pat}"));
                 }
@@ -271,8 +261,8 @@ fn build_plan(
     let mut renamed_pairs: Vec<(String, String)> = Vec::new();
     for op in ops {
         if let EditOp::Rename { from, to } = op {
-            let f = canon(from);
-            let t = canon(to);
+            let f = member_form(from);
+            let t = member_form(to);
             if f.is_empty() {
                 return Err("empty rename source".to_string());
             }
@@ -281,7 +271,7 @@ fn build_plan(
             }
             let matched: Vec<String> = surviving
                 .keys()
-                .filter(|k| matching_boundary(k, &f))
+                .filter(|k| selects(k, &f))
                 .cloned()
                 .collect();
             if matched.is_empty() {
@@ -290,12 +280,9 @@ fn build_plan(
             let moving_out: HashSet<String> = matched.iter().cloned().collect();
             let mut remap: Vec<(String, String)> = Vec::new();
             for m in &matched {
-                let new_name = if m == &f {
-                    t.clone()
-                } else {
-                    format!("{t}{}", &m[f.len()..])
-                };
-                let new_name = canon(&new_name);
+                let suffix = member_subtree_suffix(&f, m)
+                    .ok_or_else(|| format!("rename source '{f}' does not select member '{m}'"))?;
+                let new_name = member_form(&format!("{t}{suffix}"));
                 if new_name.is_empty() {
                     return Err(format!("rename produces an empty destination for '{m}'"));
                 }
@@ -343,8 +330,8 @@ fn build_plan(
         if let EditOp::Add { sources } = op {
             let items = collect_add_sources(sources, archive_path)?;
             for it in items {
-                let key = canon(&it.entry_name);
-                if add_items.iter().any(|x| canon(&x.entry_name) == key) {
+                let key = member_form(&it.entry_name);
+                if add_items.iter().any(|x| member_form(&x.entry_name) == key) {
                     return Err(format!("duplicate add member '{key}'"));
                 }
                 if surviving.contains_key(&key) {
@@ -376,7 +363,7 @@ fn build_plan(
     }
     for it in &add_items {
         finals.push(FinalMember {
-            name: canon(&it.entry_name),
+            name: member_form(&it.entry_name),
             is_dir: it.is_dir,
             size: it.size,
             source: MemberSource::Added {
@@ -401,14 +388,27 @@ fn build_plan(
     })
 }
 
+/// Validate the planned result.
+///
+/// The add-name rule is a rule about names *entering* the archive, so it is applied to members
+/// this edit creates: added sources and rename destinations. A retained member keeps the name it
+/// already carries inside the archive; whether that name could be created today is not this
+/// edit's decision to make, and re-judging it would make a delete fail because of a member it
+/// does not touch (a retained `a:b.txt` must not block `delete ok.txt`).
 fn validate_final(finals: &[FinalMember], max_bytes: u64) -> Result<(), String> {
     let mut seen: HashMap<String, ()> = HashMap::new();
     for fm in finals {
-        validate_added_name(if fm.is_dir {
-            fm.name.trim_end_matches('/')
-        } else {
-            &fm.name
-        })?;
+        let enters_archive = match &fm.source {
+            MemberSource::Added { .. } => true,
+            MemberSource::Original { orig_name, .. } => &fm.name != orig_name,
+        };
+        if enters_archive {
+            validate_added_name(if fm.is_dir {
+                fm.name.trim_end_matches('/')
+            } else {
+                &fm.name
+            })?;
+        }
         if seen.insert(fm.name.clone(), ()).is_some() {
             return Err(format!("result contains a duplicate member '{}'", fm.name));
         }
@@ -527,31 +527,6 @@ fn write_zip_replacement(
     Ok(())
 }
 
-fn methods_for(options: &EditOptions) -> Vec<sevenz_rust2::EncoderConfiguration> {
-    let level = options.level.unwrap_or(5).clamp(0, 9);
-    let mut methods = Vec::new();
-    if let Some(pass) = options.password {
-        methods.push(sevenz_rust2::EncoderConfiguration::from(
-            sevenz_rust2::encoder_options::AesEncoderOptions::new(sevenz_rust2::Password::from(
-                pass,
-            )),
-        ));
-    }
-    if level == 0 {
-        methods.push(sevenz_rust2::EncoderConfiguration::new(
-            sevenz_rust2::EncoderMethod::COPY,
-        ));
-    } else {
-        methods.push(
-            sevenz_rust2::EncoderConfiguration::new(sevenz_rust2::EncoderMethod::LZMA2)
-                .with_options(sevenz_rust2::encoder_options::EncoderOptions::Lzma2(
-                    sevenz_rust2::encoder_options::Lzma2Options::from_level(level),
-                )),
-        );
-    }
-    methods
-}
-
 fn rebuild_entry(
     src: &sevenz_rust2::ArchiveEntry,
     name: String,
@@ -586,19 +561,25 @@ fn write_7z_replacement(
 
     let mut writer = sevenz_rust2::ArchiveWriter::new(out_file)
         .map_err(|e| format!("7z writer create failed: {e}"))?;
-    writer.set_content_methods(methods_for(options));
+    // One encoder chain for pack and edit: same level clamp, same AES-then-LZMA2/COPY order.
+    // Edit re-encodes at the preset dictionary, so it passes no dictionary override.
+    writer.set_content_methods(crate::core::pack::seven_z_encoder_chain(
+        options.level.unwrap_or(5).clamp(0, 9),
+        options.password,
+        None,
+    ));
 
     let mut orig_by_name: HashMap<String, usize> = HashMap::new();
     for (i, fm) in plan.finals.iter().enumerate() {
         if let MemberSource::Original { orig_name, .. } = &fm.source {
-            orig_by_name.insert(canon(orig_name), i);
+            orig_by_name.insert(member_form(orig_name), i);
         }
     }
 
     let mut remaining = max_bytes;
     reader
         .for_each_entries(|src_entry, rd| {
-            let src_name = canon(src_entry.name());
+            let src_name = member_form(src_entry.name());
             if let Some(&i) = orig_by_name.get(&src_name) {
                 let fm = &plan.finals[i];
                 let e = rebuild_entry(src_entry, fm.name.clone(), fm.is_dir);
@@ -670,13 +651,13 @@ fn verify_replacement(
     let catalog = crate::core::catalog::read_archive_catalog(archive_path, password, max_bytes)?;
     let mut actual: Vec<(String, bool, u64)> = catalog
         .iter()
-        .map(|e| (canon(&e.name), e.is_dir, e.size))
+        .map(|e| (member_form(&e.name), e.is_dir, e.size))
         .collect();
     actual.sort();
     let mut expected: Vec<_> = plan
         .finals
         .iter()
-        .map(|entry| (canon(&entry.name), entry.is_dir, entry.size))
+        .map(|entry| (member_form(&entry.name), entry.is_dir, entry.size))
         .collect();
     expected.sort();
     if actual != expected {
@@ -779,4 +760,141 @@ pub fn edit_archive(
         let _ = fs::remove_file(&staging);
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+    use zip::write::SimpleFileOptions;
+    use zip::ZipWriter;
+
+    /// The same member name composed and in conjoining jamo, as macOS and Linux write it.
+    const COMPOSED: &str = "\u{d55c}\u{ae00}.txt";
+    const DECOMPOSED: &str = "\u{1112}\u{1161}\u{11ab}\u{1100}\u{1173}\u{11af}.txt";
+
+    /// A private working directory per test, outside the archive paths under test.
+    fn work_dir(name: &str) -> PathBuf {
+        let dir = PathBuf::from("target").join("edit_fixture").join(format!(
+            "{}_{}_{}",
+            name,
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Write a stored ZIP whose member names are exactly the given bytes.
+    fn zip_fixture(dir: &Path, name: &str, members: &[(&str, &[u8])]) -> PathBuf {
+        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+        let options =
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        for (member, content) in members {
+            writer.start_file(*member, options).unwrap();
+            io::Write::write_all(&mut writer, content).unwrap();
+        }
+        let bytes = writer.finish().unwrap().into_inner();
+        let archive = dir.join(name);
+        fs::write(&archive, bytes).unwrap();
+        archive
+    }
+
+    fn member_names(archive: &Path) -> Vec<String> {
+        crate::core::catalog::read_archive_catalog(
+            archive,
+            None,
+            crate::core::guard::DEFAULT_MAX_UNCOMPRESSED_BYTES,
+        )
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.name)
+        .collect()
+    }
+
+    fn delete(archive: &Path, members: &[&str]) -> Result<EditSummary, Box<dyn std::error::Error>> {
+        edit_archive(
+            archive,
+            &[EditOp::Delete {
+                members: members.iter().map(|m| (*m).to_string()).collect(),
+            }],
+            &EditOptions::default(),
+        )
+    }
+
+    /// Defect A: `delete ok.txt` used to fail on a retained `a:b.txt`, because the add-name
+    /// rule was applied to every member of the result instead of only to names entering it.
+    #[test]
+    fn delete_keeps_retained_member_names_out_of_the_add_rule() {
+        let dir = work_dir("retained_names");
+        let archive = zip_fixture(
+            &dir,
+            "fixture.zip",
+            &[("a:b.txt", b"ADS"), ("ok.txt", b"OK")],
+        );
+
+        delete(&archive, &["ok.txt"]).expect("a retained original name must not be re-validated");
+
+        assert_eq!(member_names(&archive), vec!["a:b.txt".to_string()]);
+        // The member colons cannot protect: deleting that member is the same rule.
+        delete(&archive, &["a:b.txt"]).expect("deleting the member by its own name still works");
+        assert!(member_names(&archive).is_empty());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A rename *does* introduce a name, so the add rule still governs its destination.
+    #[test]
+    fn rename_rejects_a_destination_the_add_rule_forbids() {
+        let dir = work_dir("rename_destination");
+        let archive = zip_fixture(&dir, "fixture.zip", &[("plain.txt", b"PLAIN")]);
+        let before = fs::read(&archive).unwrap();
+
+        let error = edit_archive(
+            &archive,
+            &[EditOp::Rename {
+                from: "plain.txt".into(),
+                to: "a:b.txt".into(),
+            }],
+            &EditOptions::default(),
+        )
+        .expect_err("a colon rename destination must be refused");
+
+        assert!(error.to_string().contains("colon"), "{error}");
+        assert_eq!(fs::read(&archive).unwrap(), before);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Defect B: a member stored with decomposed Hangul used to be invisible to `delete` even
+    /// though `cat` resolved the composed name. Both composition directions are measured, and a
+    /// name the archive does not hold stays rejected.
+    #[test]
+    fn delete_resolves_both_hangul_compositions_and_rejects_an_unrelated_name() {
+        let dir = work_dir("hangul_names");
+
+        // Stored decomposed (macOS/Linux ZIP), requested composed (what a user types).
+        let decomposed_archive = zip_fixture(&dir, "decomposed.zip", &[(DECOMPOSED, b"HANGUL")]);
+        // Stored composed, requested decomposed, which is the same rule in the other direction.
+        let composed_archive = zip_fixture(&dir, "composed.zip", &[(COMPOSED, b"HANGUL")]);
+
+        for (archive, stored, requested) in [
+            (&decomposed_archive, DECOMPOSED, COMPOSED),
+            (&composed_archive, COMPOSED, DECOMPOSED),
+        ] {
+            let error = delete(archive, &["\u{b2e4}\u{b978}.txt"])
+                .expect_err("an unrelated name must stay rejected");
+            assert!(error.to_string().contains("not found"), "{error}");
+            assert_eq!(member_names(archive), vec![stored.to_string()]);
+
+            delete(archive, &[requested])
+                .expect("the composed and decomposed names are one member");
+            assert!(member_names(archive).is_empty());
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

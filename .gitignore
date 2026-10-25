@@ -9,3 +9,7 @@ HANDOFF-*.md
 /audit/REFERENCE-RECOVERY-20261025.md
 /audit/delegation/
 /audit/diagnostics/
+
+# Python bytecode from the audit scripts
+__pycache__/
+*.pyc

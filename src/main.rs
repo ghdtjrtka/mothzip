@@ -283,6 +283,18 @@ fn run(cli: &Cli) -> AppResult<()> {
             seven_z_dict,
         } => {
             let format = format.map(|value| value.archive_format());
+            if seven_z_dict.is_some() {
+                // The dictionary only exists in LZMA2. Silently ignoring it would tell the caller it
+                // was applied, so every other destination refuses it.
+                let resolved = core::pack::resolve_pack_format(output, format)?;
+                if !matches!(resolved, core::format::ArchiveFormat::SevenZ) {
+                    return Err(format!(
+                        "--7z-dict only applies to 7z output; {} has no dictionary to set",
+                        resolved.name()
+                    )
+                    .into());
+                }
+            }
             if *from_stdin {
                 // A pipe carries bytes, not entry names, so only a single-stream codec can be
                 // written from stdin; anything else would have to invent member metadata.
@@ -319,9 +331,28 @@ fn run(cli: &Cli) -> AppResult<()> {
                     }
                     return Ok(());
                 }
-                let file = std::fs::File::create(output)?;
-                core::pack::pack_stream_from_reader(io::stdin().lock(), file, codec, level)?;
-                let bytes = std::fs::metadata(output)?.len();
+                // Same contract as an archive built from files: validate before touching the
+                // destination, write through a staging sibling, and only then replace it. A failure
+                // here must leave an existing output byte-identical, not truncated.
+                core::codec::validated_level(codec, level)?;
+                let staged = core::commit::staging_path(output, "stream");
+                let written = (|| -> Result<u64, Box<dyn std::error::Error>> {
+                    let file = std::fs::File::create(&staged)?;
+                    core::pack::pack_stream_from_reader(io::stdin().lock(), file, codec, level)?;
+                    Ok(std::fs::metadata(&staged)?.len())
+                })();
+                let bytes = match written {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        let _ = std::fs::remove_file(&staged);
+                        return Err(error);
+                    }
+                };
+                if let Err(error) = core::commit::commit_files(&[(staged.clone(), output.clone())])
+                {
+                    let _ = std::fs::remove_file(&staged);
+                    return Err(error.to_string().into());
+                }
                 if cli.json {
                     report(
                         &serde_json::json!({

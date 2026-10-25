@@ -173,7 +173,17 @@ pub enum Commands {
         reproducible: bool,
         /// Compress stdin as a single-stream archive; requires a single-stream --format
         /// (gz, zst, xz, lz4, br). The output path is not written when --to-stdout is given
-        #[arg(long, conflicts_with = "volume_bytes")]
+        #[arg(
+            long,
+            conflicts_with_all = [
+                "volume_bytes",
+                "password",
+                "password_stdin",
+                "reproducible",
+                "seven_z_dict",
+                "sources",
+            ]
+        )]
         from_stdin: bool,
         /// LZMA2 dictionary size in MiB for 7z output; matches the match finder's memory
         /// (about 10.5 MiB of peak RSS per MiB of dictionary). Defaults to the level's dictionary

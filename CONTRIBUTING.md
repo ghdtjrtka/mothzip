@@ -29,6 +29,11 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
+The release profile sets `panic = "abort"`: a panic here is a bug, not a recoverable state, and the
+unwinding tables cost about 1.7 MB of the download. Nothing uses `catch_unwind`, and `cargo test`
+runs in the default profile, so tests still unwind. If you add code that relies on catching a
+panic, move it out of the release path or raise the profile change in the pull request.
+
 The release binary is a single file with a statically linked CRT
 (`.cargo/config.toml` sets `+crt-static`), so it needs no Visual C++ Redistributable.
 
@@ -123,8 +128,10 @@ Two invariants worth knowing before you edit:
 - A failed extraction or edit leaves existing files unchanged; staging directories are removed.
 - `cat` and `--to-stdout` may emit bytes before failing. Consumers must discard output on a nonzero
   exit; the documentation states this rather than pretending otherwise.
-- Path escapes, ADS, reserved device names, links and duplicate member names are refused, not
-  sanitised silently.
+- Path escapes, ADS, reserved device names and links are refused, not sanitised silently. A
+  duplicate member name inside an archive is not an error on extraction (the last entry wins,
+  as other tools do); an edit that would create a second member with an existing name is
+  refused.
 
 ## Commits and pull requests
 
