@@ -28,11 +28,22 @@ ROOT.mkdir(parents=True)
 results = []
 
 
-def invoke(*args):
+def source_commit():
+    """A source archive has hashes but no repository commit; never borrow its parent's Git identity."""
+    try:
+        p = subprocess.run(['git', 'rev-parse', '--show-toplevel', 'HEAD'], cwd=WORKSPACE,
+                           capture_output=True, text=True, encoding='utf8')
+    except FileNotFoundError:
+        return None
+    lines = p.stdout.splitlines()
+    return lines[1] if p.returncode == 0 and len(lines) == 2 and Path(lines[0]).resolve() == WORKSPACE else None
+
+
+def invoke(*args, input_bytes=None):
     command = [str(BINARY), *map(str, args), '--json']
     start = time.monotonic()
     try:
-        p = subprocess.run(command, capture_output=True, timeout=12, cwd=ROOT)
+        p = subprocess.run(command, input=input_bytes, capture_output=True, timeout=12, cwd=ROOT)
         return dict(command=command, exit_code=p.returncode, stdout=p.stdout.decode('utf8', 'replace'),
                     stderr=p.stderr.decode('utf8', 'replace'), elapsed_ms=round((time.monotonic()-start)*1000, 2))
     except subprocess.TimeoutExpired:
@@ -248,7 +259,7 @@ for ext in ('zip','tar'):
     record(d.name,[call], output_matches=(d/'out'/'root'/'test.txt').read_bytes()==b'VALID')
 
 report=dict(binary=str(BINARY), binary_sha256=hashlib.sha256(BINARY.read_bytes()).hexdigest(),
-            source_commit=subprocess.check_output(['git','rev-parse','HEAD'],cwd=WORKSPACE,text=True).strip(),
+            source_commit=source_commit(),
             run_dir=str(ROOT), cases=results)
 (ROOT/'results.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf8')
 print('RESULTS='+str(ROOT/'results.json'))

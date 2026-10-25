@@ -100,27 +100,32 @@ unsafe fn try_decode_codepage(codepage: u32, raw_bytes: &[u8]) -> Option<String>
 /// 3. CP949 fallback (in case a non-Korean machine opens a Korean ALZip archive).
 /// 4. Lossy UTF-8 fallback.
 pub fn decode_entry_name(raw_bytes: &[u8]) -> String {
+    compose_hangul_nfc(&decode_entry_name_raw(raw_bytes))
+}
+
+/// Decode the filename without normalization so exact member lookup can precede aliases.
+pub fn decode_entry_name_raw(raw_bytes: &[u8]) -> String {
     // 1. Try UTF-8 first (Modern standard)
     if let Ok(utf8_str) = std::str::from_utf8(raw_bytes) {
-        return compose_hangul_nfc(utf8_str);
+        return utf8_str.to_string();
     }
 
     if !raw_bytes.is_empty() {
         unsafe {
             // 2. Try the current Windows system ANSI code page
             if let Some(decoded) = try_decode_codepage(CP_ACP, raw_bytes) {
-                return compose_hangul_nfc(&decoded);
+                return decoded;
             }
 
             // 3. Try Korean CP949 (if system ANSI code page was not 949)
             if let Some(decoded) = try_decode_codepage(CP949, raw_bytes) {
-                return compose_hangul_nfc(&decoded);
+                return decoded;
             }
         }
     }
 
     // 4. Last resort fallback
-    compose_hangul_nfc(&String::from_utf8_lossy(raw_bytes))
+    String::from_utf8_lossy(raw_bytes).into_owned()
 }
 
 #[cfg(test)]

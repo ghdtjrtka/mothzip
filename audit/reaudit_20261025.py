@@ -138,7 +138,7 @@ call=invoke('cat',a,'public.txt')
 record(d.name,[call],reference_content=zipfile.ZipFile(a).read('public.txt').decode())
 
 report=dict(binary=str(BINARY),binary_sha256=base['hashlib'].sha256(BINARY.read_bytes()).hexdigest(),
-            source_commit=subprocess.check_output(['git','rev-parse','HEAD'],cwd=base['WORKSPACE'],text=True).strip(),
+            source_commit=base['source_commit'](),
             run_dir=str(ROOT),cases=base['results'])
 (ROOT/'reaudit-results.json').write_text(json.dumps(report,ensure_ascii=False,indent=2),encoding='utf8')
 print('REAUDIT_RESULTS='+str(ROOT/'reaudit-results.json'))

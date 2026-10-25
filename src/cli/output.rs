@@ -56,11 +56,7 @@ pub fn report_peek(summary: &PeekSummary, json_mode: bool) {
         if item.is_dir {
             println!("   📁 {}/", item.path.trim_end_matches('/'));
         } else {
-            println!(
-                "   📄 {:40} ({})",
-                item.path,
-                print_bytes_human(item.size)
-            );
+            println!("   📄 {:40} ({})", item.path, print_bytes_human(item.size));
         }
     }
 

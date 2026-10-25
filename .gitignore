@@ -1,3 +1,11 @@
 /target
 **/*.rs.bk
 *.reg
+
+# Session handoffs, per-session delegation notes and internal recovery notes are working
+# documents, not project source.
+HANDOFF-*.md
+/audit/FINALIZATION-CHECKPOINT.md
+/audit/REFERENCE-RECOVERY-20261025.md
+/audit/delegation/
+/audit/diagnostics/

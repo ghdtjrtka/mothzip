@@ -1,0 +1,4 @@
+Asset: mothzip Windows app icon
+Generated: 2026-10-25, built-in image_gen, transparent background
+Prompt: Create one original compact mark that clearly combines a moth and file compression: a symmetrical moth with broad folded wings, short antennae, and a bold central zipper integrated into its body, suggesting zipped/compressed files. Clean contemporary app-icon design, strong distinctive silhouette, restrained depth and crisp edges, only a few broad color shapes, legible at 16, 32, 48, and 256 pixels. Centered square composition with transparent padding; no background tile, lettering, words, numbers, watermark, or fine filigree; not a butterfly.
+Source: generated transparent RGBA PNG copied into moth_icon.png. moth.ico encodes 16/24/32/48/64/128/256 pixel variants without repainting. build.rs compiles the icon and Cargo package version into the executable with the Windows SDK resource compiler.

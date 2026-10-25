@@ -35,7 +35,7 @@ pub fn evaluate_layout_plan(
     entries: &[LayoutEntryInfo],
     archive_stem: &str,
     output_base: &Path,
-) -> SmartUnpackPlan {
+) -> Result<SmartUnpackPlan, Box<dyn std::error::Error>> {
     let mut top_level_dirs = HashSet::new();
     let mut has_root_files = false;
     let mut total_uncompressed_bytes = 0u64;
@@ -43,8 +43,12 @@ pub fn evaluate_layout_plan(
     let total_entries = entries.len();
 
     for entry in entries {
-        total_uncompressed_bytes += entry.size;
-        total_compressed_bytes += entry.compressed_size;
+        total_uncompressed_bytes = total_uncompressed_bytes
+            .checked_add(entry.size)
+            .ok_or("Archive size overflow")?;
+        total_compressed_bytes = total_compressed_bytes
+            .checked_add(entry.compressed_size)
+            .ok_or("Archive compressed size overflow")?;
 
         let raw_name = entry.name.replace('\\', "/");
         let trimmed = raw_name.trim_matches('/');
@@ -89,14 +93,14 @@ pub fn evaluate_layout_plan(
         output_base.join(archive_stem)
     };
 
-    SmartUnpackPlan {
+    Ok(SmartUnpackPlan {
         target_dir,
         has_single_root,
         root_name,
         total_entries,
         total_uncompressed_bytes,
         total_compressed_bytes,
-    }
+    })
 }
 
 /// Analyze ZIP archive contents and produce a smart unpack plan.
@@ -104,33 +108,12 @@ pub fn plan_smart_unpack<R: Read + Seek>(
     archive: &mut ZipArchive<R>,
     archive_stem: &str,
     output_base: &Path,
-    password: Option<&str>,
 ) -> Result<SmartUnpackPlan, Box<dyn std::error::Error>> {
     let total_entries = archive.len();
     let mut entries_info = Vec::with_capacity(total_entries);
 
     for i in 0..total_entries {
-        let entry = match password {
-            Some(pass) => match archive.by_index_decrypt(i, pass.as_bytes()) {
-                Ok(e) => e,
-                Err(zip::result::ZipError::UnsupportedArchive(msg)) => {
-                    return Err(format!("Decryption failed: {}", msg).into());
-                }
-                Err(e) => return Err(Box::new(e)),
-            },
-            None => match archive.by_index(i) {
-                Ok(e) => e,
-                Err(zip::result::ZipError::UnsupportedArchive(msg))
-                    if msg.contains("Password") || msg.contains("encrypted") =>
-                {
-                    return Err(
-                        "Archive entry is password-protected. Please supply --password <PASS>"
-                            .into(),
-                    );
-                }
-                Err(e) => return Err(Box::new(e)),
-            },
-        };
+        let entry = archive.by_index_raw(i)?;
 
         let raw_name = crate::core::encoding::decode_entry_name(entry.name_raw());
         let is_dir = entry.is_dir() || raw_name.ends_with('/') || raw_name.ends_with('\\');
@@ -142,7 +125,7 @@ pub fn plan_smart_unpack<R: Read + Seek>(
         });
     }
 
-    Ok(evaluate_layout_plan(&entries_info, archive_stem, output_base))
+    evaluate_layout_plan(&entries_info, archive_stem, output_base)
 }
 
 /// Analyze TAR archive stream contents and produce a smart unpack plan.
@@ -151,8 +134,10 @@ pub fn plan_smart_unpack_tar<R: Read>(
     archive_stem: &str,
     output_base: &Path,
     archive_file_size: u64,
+    max_bytes: u64,
 ) -> Result<SmartUnpackPlan, Box<dyn std::error::Error>> {
     let mut entries_info = Vec::new();
+    let mut declared_total = 0u64;
 
     for entry in tar.entries()? {
         let entry = entry?;
@@ -163,6 +148,10 @@ pub fn plan_smart_unpack_tar<R: Read>(
             || decoded.ends_with('/')
             || decoded.ends_with('\\');
         let size = entry.header().size()?;
+        declared_total = declared_total
+            .checked_add(size)
+            .ok_or("Archive size overflow")?;
+        super::guard::check_zip_bomb(declared_total, max_bytes)?;
 
         entries_info.push(LayoutEntryInfo {
             name: decoded,
@@ -172,7 +161,7 @@ pub fn plan_smart_unpack_tar<R: Read>(
         });
     }
 
-    let mut plan = evaluate_layout_plan(&entries_info, archive_stem, output_base);
+    let mut plan = evaluate_layout_plan(&entries_info, archive_stem, output_base)?;
     plan.total_compressed_bytes = archive_file_size;
     Ok(plan)
 }
@@ -197,7 +186,7 @@ mod tests {
         }
 
         let mut archive = ZipArchive::new(Cursor::new(buf)).unwrap();
-        let plan = plan_smart_unpack(&mut archive, "my_archive", Path::new("C:\\out"), None).unwrap();
+        let plan = plan_smart_unpack(&mut archive, "my_archive", Path::new("C:\\out")).unwrap();
         assert!(plan.has_single_root);
         assert_eq!(plan.root_name.as_deref(), Some("my_project"));
         assert_eq!(plan.target_dir, Path::new("C:\\out"));
@@ -215,7 +204,7 @@ mod tests {
         }
 
         let mut archive = ZipArchive::new(Cursor::new(buf)).unwrap();
-        let plan = plan_smart_unpack(&mut archive, "my_archive", Path::new("C:\\out"), None).unwrap();
+        let plan = plan_smart_unpack(&mut archive, "my_archive", Path::new("C:\\out")).unwrap();
         assert!(!plan.has_single_root);
         assert_eq!(plan.target_dir, Path::new("C:\\out").join("my_archive"));
     }
@@ -231,7 +220,7 @@ mod tests {
         }
 
         let mut archive = ZipArchive::new(Cursor::new(buf)).unwrap();
-        let plan = plan_smart_unpack(&mut archive, "doc", Path::new("C:\\out"), None).unwrap();
+        let plan = plan_smart_unpack(&mut archive, "doc", Path::new("C:\\out")).unwrap();
         assert!(!plan.has_single_root);
         assert_eq!(plan.target_dir, Path::new("C:\\out").join("doc"));
     }

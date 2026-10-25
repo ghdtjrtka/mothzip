@@ -1,1 +1,7 @@
 /runs/
+/tools/
+# Delegation runtime transcripts, probe output directories, and regenerated results are evidence
+# for one session, not publishable source.
+/delegation/*.log
+/delegation/*-out/
+/delegation/split-probe-results.json

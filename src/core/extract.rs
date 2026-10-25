@@ -1,14 +1,18 @@
 use std::collections::HashSet;
 use std::fs::{self, File};
-use std::io::{self, Read};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use zip::result::ZipError;
 use zip::ZipArchive;
 
+use super::codec::StreamCodec;
 use super::format::{archive_stem_cleaned, detect_archive_format, ArchiveFormat};
-use super::guard::{check_zip_bomb, sanitize_entry_path, DEFAULT_MAX_UNCOMPRESSED_BYTES};
+use super::guard::{check_zip_bomb, copy_archive_entry, sanitize_entry_path};
 use super::smart::{plan_smart_unpack, plan_smart_unpack_tar};
+
+#[path = "selection.rs"]
+mod selection;
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct ExtractionSummary {
@@ -18,35 +22,50 @@ pub struct ExtractionSummary {
     pub smart_adjusted: bool,
 }
 
+/// Options controlling an extraction: layout policy, password, byte budget,
+/// literal member selection, and flat (leaf-only) output.
+#[derive(Debug, Clone)]
+pub struct ExtractionOptions {
+    pub smart: bool,
+    pub to_folder: bool,
+    pub password: Option<String>,
+    pub max_bytes: u64,
+    /// Literal member paths (raw identity or a directory prefix). Empty extracts everything.
+    pub members: Vec<String>,
+    /// Write only leaf filenames into the target directory, skipping directories.
+    pub flat: bool,
+}
+
+impl Default for ExtractionOptions {
+    fn default() -> Self {
+        Self {
+            smart: false,
+            to_folder: false,
+            password: None,
+            max_bytes: super::guard::DEFAULT_MAX_UNCOMPRESSED_BYTES,
+            members: Vec::new(),
+            flat: false,
+        }
+    }
+}
+
+/// Last path component of a sanitized destination, used by flat extraction.
+fn leaf_component(path: &Path) -> io::Result<PathBuf> {
+    path.file_name().map(PathBuf::from).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Archive member has no leaf filename",
+        )
+    })
+}
+
 struct StagedFile {
     temp_path: PathBuf,
     final_dest: PathBuf,
     mtime: Option<SystemTime>,
 }
 
-/// Convert Howard Hinnant civil calendar to unix epoch seconds
-fn days_from_civil(y: i64, m: u64, d: u64) -> i64 {
-    let y = y - if m <= 2 { 1 } else { 0 };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = (y - era * 400) as u64;
-    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146097 + doe as i64 - 719468
-}
-
-/// Convert zip::DateTime to std::time::SystemTime
-pub fn zip_datetime_to_system_time(dt: zip::DateTime) -> Option<SystemTime> {
-    let days = days_from_civil(dt.year() as i64, dt.month() as u64, dt.day() as u64);
-    let secs = days * 86400
-        + (dt.hour() as i64 * 3600)
-        + (dt.minute() as i64 * 60)
-        + (dt.second() as i64);
-    if secs >= 0 {
-        Some(UNIX_EPOCH + Duration::from_secs(secs as u64))
-    } else {
-        None
-    }
-}
+pub use super::format::zip_datetime_to_system_time;
 
 /// Resolve and strictly verify the target extraction directory against the caller's base output directory.
 /// Guards against junction/symlink redirection where target_dir points outside output_base.
@@ -57,7 +76,7 @@ fn resolve_and_verify_target_dir(
     if !output_base.exists() {
         fs::create_dir_all(output_base)?;
     }
-    let resolved_base = output_base.canonicalize().unwrap_or_else(|_| output_base.to_path_buf());
+    let resolved_base = output_base.canonicalize()?;
 
     let target_dir_existed_before = target_dir.exists();
     if target_dir_existed_before {
@@ -74,7 +93,7 @@ fn resolve_and_verify_target_dir(
 
     fs::create_dir_all(target_dir)?;
 
-    let resolved_target = target_dir.canonicalize().unwrap_or_else(|_| target_dir.to_path_buf());
+    let resolved_target = target_dir.canonicalize()?;
 
     if !resolved_target.starts_with(&resolved_base) {
         return Err(format!(
@@ -89,7 +108,10 @@ fn resolve_and_verify_target_dir(
 }
 
 /// Verify that no ancestor directory of `dest_path` is a symlink or junction escaping `resolved_target`.
-fn verify_safe_ancestors(dest_path: &Path, resolved_target: &Path) -> Result<(), Box<dyn std::error::Error>> {
+fn verify_safe_ancestors(
+    dest_path: &Path,
+    resolved_target: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut curr = dest_path.parent();
     while let Some(dir) = curr {
         if dir == resolved_target {
@@ -133,16 +155,13 @@ fn path_collision_key(p: &Path) -> String {
 }
 
 #[cfg(not(windows))]
-fn path_collision_key(p: &Path) -> PathBuf {
-    p.to_path_buf()
+fn path_collision_key(p: &Path) -> String {
+    p.to_string_lossy().into_owned()
 }
 
 /// Disambiguate destination path if distinct archive entries normalize/sanitize to the same path.
 /// Respects case-insensitivity on Windows filesystem.
-fn disambiguate_dest_path(
-    candidate: PathBuf,
-    seen_destinations: &mut HashSet<String>,
-) -> PathBuf {
+fn disambiguate_dest_path(candidate: PathBuf, seen_destinations: &mut HashSet<String>) -> PathBuf {
     let key = path_collision_key(&candidate);
     if !seen_destinations.contains(&key) {
         seen_destinations.insert(key);
@@ -175,255 +194,238 @@ fn disambiguate_dest_path(
     }
 }
 
-/// Safely unlink an existing file, breaking hardlinks or symlinks without mutating outside targets' attributes.
-#[cfg(windows)]
-fn safe_unlink_file(path: &Path) -> std::io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-
-    if let Ok(meta) = fs::symlink_metadata(path) {
-        if meta.file_type().is_symlink() {
-            return fs::remove_file(path);
-        }
-    }
-
-    #[repr(C)]
-    struct FileDispositionInfoEx {
-        flags: u32,
-    }
-    const FILE_DISPOSITION_INFO_EX: i32 = 21;
-    const FILE_DISPOSITION_FLAG_DELETE: u32 = 0x00000001;
-    const FILE_DISPOSITION_FLAG_POSIX_SEMANTICS: u32 = 0x00000002;
-    const FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE: u32 = 0x00000010;
-
-    #[link(name = "kernel32")]
-    extern "system" {
-        fn CreateFileW(
-            lpFileName: *const u16,
-            dwDesiredAccess: u32,
-            dwShareMode: u32,
-            lpSecurityAttributes: *mut std::ffi::c_void,
-            dwCreationDisposition: u32,
-            dwFlagsAndAttributes: u32,
-            hTemplateFile: *mut std::ffi::c_void,
-        ) -> *mut std::ffi::c_void;
-        fn SetFileInformationByHandle(
-            hFile: *mut std::ffi::c_void,
-            FileInformationClass: i32,
-            lpFileInformation: *const std::ffi::c_void,
-            dwBufferSize: u32,
-        ) -> i32;
-        fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
-    }
-
-    const DELETE: u32 = 0x00010000;
-    const FILE_SHARE_READ: u32 = 1;
-    const FILE_SHARE_WRITE: u32 = 2;
-    const FILE_SHARE_DELETE: u32 = 4;
-    const OPEN_EXISTING: u32 = 3;
-    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x02000000;
-
-    let handle = unsafe {
-        CreateFileW(
-            wide.as_ptr(),
-            DELETE,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            std::ptr::null_mut(),
-            OPEN_EXISTING,
-            FILE_FLAG_BACKUP_SEMANTICS,
-            std::ptr::null_mut(),
-        )
-    };
-
-    if handle != -1isize as *mut std::ffi::c_void && !handle.is_null() {
-        let info = FileDispositionInfoEx {
-            flags: FILE_DISPOSITION_FLAG_DELETE
-                | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS
-                | FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
-        };
-        let res = unsafe {
-            SetFileInformationByHandle(
-                handle,
-                FILE_DISPOSITION_INFO_EX,
-                &info as *const _ as *const std::ffi::c_void,
-                std::mem::size_of::<FileDispositionInfoEx>() as u32,
-            )
-        };
-        unsafe { CloseHandle(handle) };
-        if res != 0 {
-            return Ok(());
-        }
-    }
-
-    if let Ok(meta) = path.metadata() {
-        let mut perms = meta.permissions();
-        if perms.readonly() {
-            #[allow(clippy::permissions_set_readonly_false)]
-            perms.set_readonly(false);
-            let _ = fs::set_permissions(path, perms);
-        }
-    }
-    fs::remove_file(path)
-}
-
-#[cfg(not(windows))]
-fn safe_unlink_file(path: &Path) -> std::io::Result<()> {
-    fs::remove_file(path)
-}
-
-/// Commit staged files to their final destinations with atomic validation.
-/// If any file/directory type collision exists, aborts before mutating user files.
+/// Validate the entire resulting tree before committing any user-visible file.
+/// Runtime commit failures restore every preceding replacement via the shared journal.
 fn commit_staged_extraction(
     dirs_to_create: Vec<PathBuf>,
     staged_files: Vec<StagedFile>,
     staging_dir: &Path,
     target_root: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // 1. Pre-flight check on directories
-    for dir in &dirs_to_create {
-        if dir.exists() && dir.is_file() {
-            let _ = fs::remove_dir_all(staging_dir);
-            return Err(format!(
-                "Cannot extract directory '{}': an existing file with the same name already exists",
-                dir.display()
-            )
-            .into());
-        }
-        let mut curr = dir.parent();
-        while let Some(parent) = curr {
-            if parent == target_root {
-                break;
+    let mut created_dirs = Vec::new();
+    let mut recovery_required = false;
+    let result: Result<(), Box<dyn std::error::Error>> = (|| {
+        let file_keys: HashSet<_> = staged_files
+            .iter()
+            .map(|file| path_collision_key(&file.final_dest))
+            .collect();
+        let mut directories: std::collections::BTreeSet<PathBuf> =
+            dirs_to_create.into_iter().collect();
+        for file in &staged_files {
+            let mut current = file.final_dest.parent();
+            while let Some(parent) = current {
+                if parent == target_root {
+                    break;
+                }
+                if !parent.starts_with(target_root) {
+                    return Err(format!(
+                        "Destination escapes extraction root: {}",
+                        parent.display()
+                    )
+                    .into());
+                }
+                directories.insert(parent.to_path_buf());
+                current = parent.parent();
             }
-            if parent.exists() && parent.is_file() {
-                let _ = fs::remove_dir_all(staging_dir);
+        }
+        // Include the ancestors of explicit empty directories too.
+        for dir in directories.clone() {
+            let mut current = dir.parent();
+            while let Some(parent) = current {
+                if parent == target_root {
+                    break;
+                }
+                if !parent.starts_with(target_root) {
+                    return Err(
+                        format!("Directory escapes extraction root: {}", parent.display()).into(),
+                    );
+                }
+                directories.insert(parent.to_path_buf());
+                current = parent.parent();
+            }
+        }
+        for dir in &directories {
+            if file_keys.contains(&path_collision_key(dir)) {
                 return Err(format!(
-                    "Cannot extract directory '{}': ancestor path '{}' is an existing file",
-                    dir.display(),
-                    parent.display()
+                    "Archive uses '{}' as both a file and a directory",
+                    dir.display()
                 )
                 .into());
             }
-            curr = parent.parent();
+            verify_safe_ancestors(dir, target_root)?;
+            match fs::symlink_metadata(dir) {
+                Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                    return Err(format!(
+                        "Destination directory is a file or link: {}",
+                        dir.display()
+                    )
+                    .into());
+                }
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
         }
-    }
-
-    // 2. Pre-flight check on staged files
-    for staged in &staged_files {
-        if staged.final_dest.exists() && staged.final_dest.is_dir() {
-            let _ = fs::remove_dir_all(staging_dir);
+        for file in &staged_files {
+            verify_safe_ancestors(&file.final_dest, target_root)?;
+            match fs::symlink_metadata(&file.final_dest) {
+                Ok(metadata) if metadata.is_dir() => {
+                    return Err(format!(
+                        "Destination file is a directory: {}",
+                        file.final_dest.display()
+                    )
+                    .into());
+                }
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+            // Set times on the owned staged object, never reopen a possibly redirected destination.
+            let staged = fs::OpenOptions::new().write(true).open(&file.temp_path)?;
+            if let Some(mtime) = file.mtime {
+                staged.set_times(fs::FileTimes::new().set_modified(mtime))?;
+            }
+            staged.sync_all()?;
+        }
+        let mut ordered: Vec<_> = directories.into_iter().collect();
+        ordered.sort_by_key(|dir| dir.components().count());
+        for dir in ordered {
+            if !dir.exists() {
+                fs::create_dir(&dir)?;
+                created_dirs.push(dir);
+            }
+        }
+        let replacements: Vec<_> = staged_files
+            .iter()
+            .map(|file| (file.temp_path.clone(), file.final_dest.clone()))
+            .collect();
+        if let Err(e) = super::commit::commit_files(&replacements) {
+            recovery_required = e.recovery_required;
+            return Err(e.into());
+        }
+        Ok(())
+    })();
+    if !recovery_required {
+        if result.is_err() {
+            for dir in created_dirs.iter().rev() {
+                let _ = fs::remove_dir(dir);
+            }
+        }
+        if let Err(e) = fs::remove_dir_all(staging_dir) {
+            let state = match &result {
+                Ok(()) => "Files committed".to_string(),
+                Err(cause) => cause.to_string(),
+            };
             return Err(format!(
-                "Cannot extract file '{}': an existing directory with the same name already exists",
-                staged.final_dest.display()
+                "{}; staging retained at '{}': {}",
+                state,
+                staging_dir.display(),
+                e
             )
             .into());
         }
-        let mut curr = staged.final_dest.parent();
-        while let Some(parent) = curr {
-            if parent == target_root {
-                break;
-            }
-            if parent.exists() && parent.is_file() {
-                let _ = fs::remove_dir_all(staging_dir);
-                return Err(format!(
-                    "Cannot extract file '{}': ancestor path '{}' is an existing file",
-                    staged.final_dest.display(),
-                    parent.display()
-                )
-                .into());
-            }
-            curr = parent.parent();
-        }
     }
-
-    // 3. Pre-flight passed: apply directories
-    for dir in dirs_to_create {
-        fs::create_dir_all(&dir)?;
-    }
-
-    // 4. Move staged files into position
-    for staged in staged_files {
-        if let Some(parent) = staged.final_dest.parent() {
-            if !parent.exists() {
-                fs::create_dir_all(parent)?;
-            }
-        }
-
-        if staged.final_dest.exists() || fs::symlink_metadata(&staged.final_dest).is_ok() {
-            safe_unlink_file(&staged.final_dest)?;
-        }
-
-        fs::rename(&staged.temp_path, &staged.final_dest)?;
-
-        if let Some(mod_time) = staged.mtime {
-            if let Ok(f) = fs::OpenOptions::new().write(true).open(&staged.final_dest) {
-                let _ = f.set_times(fs::FileTimes::new().set_modified(mod_time));
-            }
-        }
-    }
-
-    let _ = fs::remove_dir_all(staging_dir);
-    Ok(())
+    result
 }
 
 /// Safely extract an archive (.zip, .tar.gz, .tgz, .tar, .gz) with Zip/Tar-Slip protection,
 /// smart unpack, timestamp preservation, and password support.
+/// Extract an archive with the legacy flat option signature.
+/// Options is a thin wrapper over [`extract_archive_with_options`] that selects
+/// all members and writes them in their original layout.
 pub fn extract_archive(
     archive_path: &Path,
     output_base: &Path,
     smart: bool,
     force_subfolder: bool,
     password: Option<&str>,
+    max_bytes: u64,
+) -> Result<ExtractionSummary, Box<dyn std::error::Error>> {
+    extract_archive_with_options(
+        archive_path,
+        output_base,
+        &ExtractionOptions {
+            smart,
+            to_folder: force_subfolder,
+            password: password.map(str::to_owned),
+            max_bytes,
+            members: Vec::new(),
+            flat: false,
+        },
+    )
+}
+
+/// One producer for all extraction: layout, staging, guards, collision handling,
+/// shared commit, literal member selection, and flat (leaf-only) output.
+pub fn extract_archive_with_options(
+    archive_path: &Path,
+    output_base: &Path,
+    opts: &ExtractionOptions,
 ) -> Result<ExtractionSummary, Box<dyn std::error::Error>> {
     let format = detect_archive_format(archive_path)?;
+
+    // Validate literal member selections against the raw catalog *before* any
+    // staging or commit happens, so missing requested members never disturb
+    // existing destination files.
+    let spec = if opts.members.is_empty() {
+        None
+    } else {
+        let catalog = super::catalog::read_archive_catalog(
+            archive_path,
+            opts.password.as_deref(),
+            opts.max_bytes,
+        )?;
+        Some(selection::SelectionSpec::build(&catalog, &opts.members)?)
+    };
+
     match format {
-        ArchiveFormat::Zip => {
-            extract_zip_archive(archive_path, output_base, smart, force_subfolder, password)
-        }
-        ArchiveFormat::TarGz => {
-            extract_tar_archive(archive_path, output_base, true, smart, force_subfolder)
-        }
+        ArchiveFormat::Zip => extract_zip_archive(archive_path, output_base, opts, spec.as_ref()),
         ArchiveFormat::Tar => {
-            extract_tar_archive(archive_path, output_base, false, smart, force_subfolder)
+            extract_tar_archive(archive_path, output_base, None, opts, spec.as_ref())
         }
-        ArchiveFormat::Gz => {
-            extract_gz_archive(archive_path, output_base, smart, force_subfolder)
+        ArchiveFormat::TarStream(codec) => {
+            extract_tar_archive(archive_path, output_base, Some(codec), opts, spec.as_ref())
         }
+        ArchiveFormat::Stream(codec) => {
+            extract_stream_archive(archive_path, output_base, codec, opts, spec.as_ref())
+        }
+        ArchiveFormat::SevenZ => extract_7z_archive(archive_path, output_base, opts, spec.as_ref()),
+        ArchiveFormat::Rar => extract_rar_archive(archive_path, output_base, opts, spec.as_ref()),
     }
 }
 
-/// Extract a standard .zip archive using staged atomic transactions
-fn extract_zip_archive(
+/// Extract a .7z archive using staged atomic transactions
+fn extract_7z_archive(
     archive_path: &Path,
     output_base: &Path,
-    smart: bool,
-    force_subfolder: bool,
-    password: Option<&str>,
+    opts: &ExtractionOptions,
+    spec: Option<&selection::SelectionSpec>,
 ) -> Result<ExtractionSummary, Box<dyn std::error::Error>> {
-    let file = File::open(archive_path)?;
-    let mut archive = ZipArchive::new(file)?;
-    let archive_stem = archive_stem_cleaned(archive_path);
+    let password = opts.password.as_deref();
+    let max_bytes = opts.max_bytes;
+    let flat = opts.flat;
 
-    let (target_dir, smart_adjusted) = if force_subfolder {
-        let total_uncompressed: u64 = (0..archive.len())
-            .filter_map(|i| match password {
-                Some(pass) => archive.by_index_decrypt(i, pass.as_bytes()).ok().map(|e| e.size()),
-                None => archive.by_index(i).ok().map(|e| e.size()),
-            })
-            .sum();
-        check_zip_bomb(total_uncompressed, DEFAULT_MAX_UNCOMPRESSED_BYTES)?;
+    let catalog =
+        super::catalog::read_archive_catalog(archive_path, password, max_bytes).map_err(|e| {
+            let msg = e.to_string();
+            if msg.to_lowercase().contains("password") {
+                "Archive is password-protected. Please supply --password <PASS>".to_string()
+            } else {
+                msg
+            }
+        })?;
+    let archive_stem = archive_stem_cleaned(archive_path);
+    let layout_entries: Vec<super::smart::LayoutEntryInfo> =
+        catalog.iter().map(|c| c.to_layout_entry()).collect();
+    let plan = super::smart::evaluate_layout_plan(&layout_entries, &archive_stem, output_base)?;
+
+    check_zip_bomb(plan.total_uncompressed_bytes, max_bytes)?;
+
+    let (target_dir, smart_adjusted) = if opts.to_folder {
         (output_base.join(&archive_stem), true)
-    } else if smart {
-        let plan = plan_smart_unpack(&mut archive, &archive_stem, output_base, password)?;
-        check_zip_bomb(plan.total_uncompressed_bytes, DEFAULT_MAX_UNCOMPRESSED_BYTES)?;
+    } else if opts.smart {
         (plan.target_dir, !plan.has_single_root)
     } else {
-        let total_uncompressed: u64 = (0..archive.len())
-            .filter_map(|i| match password {
-                Some(pass) => archive.by_index_decrypt(i, pass.as_bytes()).ok().map(|e| e.size()),
-                None => archive.by_index(i).ok().map(|e| e.size()),
-            })
-            .sum();
-        check_zip_bomb(total_uncompressed, DEFAULT_MAX_UNCOMPRESSED_BYTES)?;
         (output_base.to_path_buf(), false)
     };
 
@@ -434,8 +436,17 @@ fn extract_zip_archive(
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let staging_dir = resolved_target.join(format!(".mothzip_stage_{}_{}", std::process::id(), staging_token));
-    fs::create_dir_all(&staging_dir)?;
+    let staging_dir = resolved_target.join(format!(
+        ".mothzip_stage_{}_{}",
+        std::process::id(),
+        staging_token
+    ));
+    fs::create_dir(&staging_dir)?;
+
+    let pass = match password {
+        Some(p) => sevenz_rust2::Password::from(p),
+        None => sevenz_rust2::Password::empty(),
+    };
 
     let mut staged_files = Vec::new();
     let mut dirs_to_create = Vec::new();
@@ -443,94 +454,548 @@ fn extract_zip_archive(
     let mut extracted_bytes = 0u64;
     let mut entry_index = 0usize;
 
-    let stage_result: Result<(), Box<dyn std::error::Error>> = (|| -> Result<(), Box<dyn std::error::Error>> {
-        for i in 0..archive.len() {
-            let mut entry = match password {
-                Some(pass) => match archive.by_index_decrypt(i, pass.as_bytes()) {
-                    Ok(e) => e,
-                    Err(ZipError::UnsupportedArchive(msg)) => {
-                        return Err(format!("Decryption failed: {}", msg).into());
-                    }
-                    Err(e) => return Err(Box::new(e) as Box<dyn std::error::Error>),
-                },
-                None => match archive.by_index(i) {
-                    Ok(e) => e,
-                    Err(ZipError::UnsupportedArchive(msg))
-                        if msg.contains("Password") || msg.contains("encrypted") =>
-                    {
-                        return Err(
-                            "Archive entry is password-protected. Please supply --password <PASS>"
-                                .into(),
-                        );
-                    }
-                    Err(e) => return Err(Box::new(e) as Box<dyn std::error::Error>),
-                },
-            };
-
-            let raw_name = super::encoding::decode_entry_name(entry.name_raw());
-
-            // Skip macOS/Windows system junk files (__MACOSX, .DS_Store, Thumbs.db)
-            let normalized = raw_name.replace('\\', "/");
-            if normalized.starts_with("__MACOSX/")
-                || normalized == "__MACOSX"
-                || normalized.ends_with("/.DS_Store")
-                || normalized == ".DS_Store"
-                || normalized.ends_with("/Thumbs.db")
-                || normalized == "Thumbs.db"
-            {
-                continue;
-            }
-
-            let raw_dest = sanitize_entry_path(&resolved_target, &raw_name)?;
-            verify_safe_ancestors(&raw_dest, &resolved_target)?;
-
-            let is_dir_entry = entry.is_dir() || raw_name.ends_with('/') || raw_name.ends_with('\\');
-
-            if is_dir_entry {
-                dirs_to_create.push(raw_dest);
+    let stage_result: Result<(), Box<dyn std::error::Error>> = (|| {
+        let mut reader = super::format::open_7z_reader(archive_path, &pass).map_err(|e| {
+            let msg = e.to_string();
+            if msg.to_lowercase().contains("password") {
+                "Archive is password-protected. Please supply --password <PASS>".to_string()
             } else {
-                let final_dest = disambiguate_dest_path(raw_dest, &mut seen_destinations);
-                verify_safe_ancestors(&final_dest, &resolved_target)?;
+                format!("7z open failed: {}", msg)
+            }
+        })?;
 
-                let stage_file_path = staging_dir.join(format!("{}.tmp", entry_index));
+        reader
+            .for_each_entries(|entry, read_stream| {
+                let entry_name = entry.name().replace('\\', "/");
+                let norm_name = super::encoding::compose_hangul_nfc(&entry_name);
+
+                if entry.is_anti_item() {
+                    return Err(sevenz_rust2::Error::from(io::Error::other(format!(
+                        "Unsupported entry '{}': 7z anti-items cannot be extracted",
+                        norm_name
+                    ))));
+                }
+
+                if entry.is_directory() {
+                    if !flat {
+                        let sanitized =
+                            sanitize_entry_path(&resolved_target, &norm_name).map_err(|e| {
+                                sevenz_rust2::Error::from(io::Error::other(e.to_string()))
+                            })?;
+                        dirs_to_create.push(sanitized);
+                    }
+                    return Ok(true);
+                }
+
+                // Literal member selection; drain unselected solid streams so later
+                // selected members stay readable.
+                if let Some(spec) = spec {
+                    if !spec.matches(&entry_name) {
+                        if entry.has_stream() {
+                            super::guard::drain_archive_entry(
+                                read_stream,
+                                Some(entry.size()),
+                                max_bytes,
+                            )
+                            .map_err(|e| {
+                                sevenz_rust2::Error::from(io::Error::other(e.to_string()))
+                            })?;
+                        }
+                        return Ok(true);
+                    }
+                }
+
+                let sanitized = sanitize_entry_path(&resolved_target, &norm_name)
+                    .map_err(|e| sevenz_rust2::Error::from(io::Error::other(e.to_string())))?;
+                let candidate = if flat {
+                    resolved_target.join(leaf_component(&sanitized)?)
+                } else {
+                    sanitized
+                };
+                let final_dest = disambiguate_dest_path(candidate, &mut seen_destinations);
+
+                let temp_path = staging_dir.join(format!("entry_{}", entry_index));
                 entry_index += 1;
 
-                let mut outfile = File::create(&stage_file_path)?;
+                let mut out_file = File::create(&temp_path)
+                    .map_err(|e| sevenz_rust2::Error::from(io::Error::other(e.to_string())))?;
 
-                let max_entry_bytes = entry.size() + 4096;
-                let mut limited = (&mut entry).take(max_entry_bytes + 1);
-                let written = io::copy(&mut limited, &mut outfile).map_err(|e| -> Box<dyn std::error::Error> {
-                    format!("Extraction error on '{}': {}", raw_name, e).into()
-                })?;
-
-                if written > max_entry_bytes {
-                    return Err(format!(
-                        "Security violation: entry '{}' exceeded declared size (deceptive zip-bomb detected)",
-                        raw_name
-                    )
-                    .into());
-                }
+                let written = copy_archive_entry(
+                    read_stream,
+                    &mut out_file,
+                    Some(entry.size()),
+                    extracted_bytes,
+                    max_bytes,
+                )
+                .map_err(|e| sevenz_rust2::Error::from(io::Error::other(e.to_string())))?;
 
                 extracted_bytes += written;
-                if extracted_bytes > DEFAULT_MAX_UNCOMPRESSED_BYTES {
-                    return Err(format!(
-                        "Security violation: total extracted data exceeded global safety threshold ({} GB)",
-                        DEFAULT_MAX_UNCOMPRESSED_BYTES / (1024 * 1024 * 1024)
-                    )
-                    .into());
-                }
 
-                let mtime = entry.last_modified().and_then(zip_datetime_to_system_time);
+                let mtime = if entry.has_last_modified_date {
+                    super::format::nt_time_to_system_time(entry.last_modified_date.into())
+                } else {
+                    None
+                };
 
                 staged_files.push(StagedFile {
-                    temp_path: stage_file_path,
+                    temp_path,
                     final_dest,
                     mtime,
                 });
-            }
-        }
+
+                Ok(true)
+            })
+            .map_err(|e| -> Box<dyn std::error::Error> {
+                let msg = e.to_string();
+                if msg.to_lowercase().contains("password") {
+                    "Decryption failed: bad password or corrupted archive".into()
+                } else {
+                    format!("7z extraction failed: {}", msg).into()
+                }
+            })?;
+
         Ok(())
     })();
+
+    if let Err(e) = stage_result {
+        let _ = fs::remove_dir_all(&staging_dir);
+        if !target_dir_existed_before {
+            let _ = fs::remove_dir(&resolved_target);
+        }
+        return Err(e);
+    }
+
+    let extracted_files = staged_files.len();
+    commit_staged_extraction(dirs_to_create, staged_files, &staging_dir, &resolved_target)?;
+
+    Ok(ExtractionSummary {
+        extracted_files,
+        extracted_bytes,
+        target_dir: resolved_target,
+        smart_adjusted,
+    })
+}
+
+/// Extract a .rar archive using staged atomic transactions
+fn extract_rar_archive(
+    archive_path: &Path,
+    output_base: &Path,
+    opts: &ExtractionOptions,
+    spec: Option<&selection::SelectionSpec>,
+) -> Result<ExtractionSummary, Box<dyn std::error::Error>> {
+    let password = opts.password.as_deref();
+    let max_bytes = opts.max_bytes;
+    let flat = opts.flat;
+
+    let catalog =
+        super::catalog::read_archive_catalog(archive_path, password, max_bytes).map_err(|e| {
+            let msg = e.to_string();
+            if msg.to_lowercase().contains("password") || msg.to_lowercase().contains("encrypted") {
+                "Archive is password-protected. Please supply --password <PASS>".to_string()
+            } else {
+                msg
+            }
+        })?;
+    let archive_stem = archive_stem_cleaned(archive_path);
+    let layout_entries: Vec<super::smart::LayoutEntryInfo> =
+        catalog.iter().map(|c| c.to_layout_entry()).collect();
+    let plan = super::smart::evaluate_layout_plan(&layout_entries, &archive_stem, output_base)?;
+
+    check_zip_bomb(plan.total_uncompressed_bytes, max_bytes)?;
+
+    let (target_dir, smart_adjusted) = if opts.to_folder {
+        (output_base.join(&archive_stem), true)
+    } else if opts.smart {
+        (plan.target_dir, !plan.has_single_root)
+    } else {
+        (output_base.to_path_buf(), false)
+    };
+
+    let (resolved_target, target_dir_existed_before) =
+        resolve_and_verify_target_dir(output_base, &target_dir)?;
+
+    let staging_token = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let staging_dir = resolved_target.join(format!(
+        ".mothzip_stage_{}_{}",
+        std::process::id(),
+        staging_token
+    ));
+    fs::create_dir(&staging_dir)?;
+
+    let mut staged_files = Vec::new();
+    let mut dirs_to_create = Vec::new();
+    let mut seen_destinations = HashSet::new();
+    let mut extracted_bytes = 0u64;
+    let mut entry_index = 0usize;
+
+    let stage_result: Result<(), Box<dyn std::error::Error>> = (|| {
+        let mut options = rars::ArchiveReadOptions::default();
+        if let Some(p) = password {
+            options.password = Some(p.as_bytes());
+        }
+        options.max_total_output_bytes = Some(max_bytes);
+        options.max_member_output_bytes = Some(max_bytes);
+
+        let volumes = super::format::find_volume_files(archive_path);
+        if volumes.len() > 1 {
+            let archives = volumes
+                .iter()
+                .map(|v| rars::ArchiveReader::read_path_with_options(v, options))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| {
+                    let msg = e.to_string();
+                    if msg.to_lowercase().contains("password")
+                        || msg.to_lowercase().contains("encrypted")
+                    {
+                        "Archive is password-protected. Please supply --password <PASS>".to_string()
+                    } else {
+                        format!("Failed to open RAR volume set: {}", msg)
+                    }
+                })?;
+
+            let is_rar5 = archives
+                .first()
+                .map(|a| a.family() == rars::ArchiveFamily::Rar50Plus)
+                .unwrap_or(false);
+
+            rars::extract_volumes_to_with_options(&archives, options, |entry_meta| {
+                let raw_name =
+                    super::encoding::decode_entry_name_raw(&entry_meta.name).replace('\\', "/");
+                let norm_name = super::encoding::compose_hangul_nfc(&raw_name);
+
+                if entry_meta.is_directory {
+                    if !flat {
+                        let sanitized =
+                            sanitize_entry_path(&resolved_target, &norm_name).map_err(|_| {
+                                rars::Error::UnsafePath("unsafe directory path in archive")
+                            })?;
+                        dirs_to_create.push(sanitized);
+                    }
+                    return Ok(Box::new(io::sink()));
+                }
+
+                if let Some(spec) = spec {
+                    if !spec.matches(&raw_name) {
+                        return Ok(Box::new(io::sink()));
+                    }
+                }
+
+                let sanitized = sanitize_entry_path(&resolved_target, &norm_name)
+                    .map_err(|_| rars::Error::UnsafePath("unsafe file path in archive"))?;
+                let candidate = if flat {
+                    resolved_target.join(leaf_component(&sanitized)?)
+                } else {
+                    sanitized
+                };
+                let final_dest = disambiguate_dest_path(candidate, &mut seen_destinations);
+
+                let temp_path = staging_dir.join(format!("entry_{}", entry_index));
+                entry_index += 1;
+
+                let out_file = File::create(&temp_path)
+                    .map_err(|e| rars::Error::from(io::Error::other(e.to_string())))?;
+
+                let mtime = entry_meta.file_time.and_then(|ft| {
+                    if is_rar5 {
+                        super::format::unix_secs_to_system_time(ft as u64)
+                    } else {
+                        let dos_date = (ft >> 16) as u16;
+                        let dos_time = (ft & 0xFFFF) as u16;
+                        super::format::dos_time_to_system_time(dos_date, dos_time)
+                    }
+                });
+
+                staged_files.push(StagedFile {
+                    temp_path,
+                    final_dest,
+                    mtime,
+                });
+
+                Ok(Box::new(out_file))
+            })
+            .map_err(|e| -> Box<dyn std::error::Error> {
+                let msg = e.to_string();
+                if msg.to_lowercase().contains("password")
+                    || msg.to_lowercase().contains("encrypted")
+                {
+                    "Decryption failed: bad password or corrupted RAR block".into()
+                } else {
+                    format!("RAR volume extraction failed: {}", msg).into()
+                }
+            })?;
+        } else {
+            let archive = rars::ArchiveReader::read_path_with_options(archive_path, options)
+                .map_err(|e| {
+                    let msg = e.to_string();
+                    if msg.to_lowercase().contains("password")
+                        || msg.to_lowercase().contains("encrypted")
+                    {
+                        "Archive is password-protected. Please supply --password <PASS>".to_string()
+                    } else {
+                        format!("Failed to open RAR archive: {}", msg)
+                    }
+                })?;
+
+            archive
+                .extract_with_control(options, |member| {
+                    let raw_name =
+                        super::encoding::decode_entry_name_raw(&member.meta.name).replace('\\', "/");
+                    let norm_name = super::encoding::compose_hangul_nfc(&raw_name);
+
+                    if member.meta.is_redirection {
+                        return Err(rars::Error::from(io::Error::other(format!(
+                            "Unsupported entry '{}': RAR links/redirections are not supported for extraction",
+                            norm_name
+                        ))));
+                    }
+
+                    if member.meta.is_directory {
+                        if !flat {
+                            let sanitized = sanitize_entry_path(&resolved_target, &norm_name)
+                                .map_err(|_| {
+                                    rars::Error::UnsafePath("unsafe directory path in archive")
+                                })?;
+                            dirs_to_create.push(sanitized);
+                        }
+                        return Ok(rars::ExtractionDecision::Skip);
+                    }
+
+                    if let Some(spec) = spec {
+                        if !spec.matches(&raw_name) {
+                            // Solid archives cannot skip member data; drain the
+                            // unselected member into a null writer to advance the
+                            // decoder so later selected members stay readable.
+                            return Ok(rars::ExtractionDecision::Extract(Box::new(
+                                io::sink(),
+                            )));
+                        }
+                    }
+
+                    let sanitized = sanitize_entry_path(&resolved_target, &norm_name)
+                        .map_err(|_| rars::Error::UnsafePath("unsafe file path in archive"))?;
+                    let candidate = if flat {
+                        resolved_target.join(leaf_component(&sanitized)?)
+                    } else {
+                        sanitized
+                    };
+                    let final_dest = disambiguate_dest_path(candidate, &mut seen_destinations);
+
+                    let temp_path = staging_dir.join(format!("entry_{}", entry_index));
+                    entry_index += 1;
+
+                    let out_file = File::create(&temp_path)
+                        .map_err(|e| rars::Error::from(io::Error::other(e.to_string())))?;
+
+                    let mtime = member.meta.file_time.and_then(|ft| match member.meta.family {
+                        rars::ArchiveFamily::Rar50Plus => {
+                            super::format::unix_secs_to_system_time(ft as u64)
+                        }
+                        _ => {
+                            let dos_date = (ft >> 16) as u16;
+                            let dos_time = (ft & 0xFFFF) as u16;
+                            super::format::dos_time_to_system_time(dos_date, dos_time)
+                        }
+                    });
+
+                    staged_files.push(StagedFile {
+                        temp_path,
+                        final_dest,
+                        mtime,
+                    });
+
+                    extracted_bytes = extracted_bytes
+                        .checked_add(member.meta.unpacked_size)
+                        .ok_or_else(|| {
+                            rars::Error::from(io::Error::other(
+                                "Archive uncompressed size overflow",
+                            ))
+                        })?;
+
+                    Ok(rars::ExtractionDecision::Extract(Box::new(out_file)))
+                })
+                .map_err(|e| -> Box<dyn std::error::Error> {
+                    let msg = e.to_string();
+                    if msg.to_lowercase().contains("password")
+                        || msg.to_lowercase().contains("encrypted")
+                    {
+                        "Decryption failed: bad password or corrupted RAR block".into()
+                    } else {
+                        format!("RAR extraction failed: {}", msg).into()
+                    }
+                })?;
+        }
+
+        Ok(())
+    })();
+
+    if let Err(e) = stage_result {
+        let _ = fs::remove_dir_all(&staging_dir);
+        if !target_dir_existed_before {
+            let _ = fs::remove_dir(&resolved_target);
+        }
+        return Err(e);
+    }
+
+    let extracted_files = staged_files.len();
+    commit_staged_extraction(dirs_to_create, staged_files, &staging_dir, &resolved_target)?;
+
+    Ok(ExtractionSummary {
+        extracted_files,
+        extracted_bytes,
+        target_dir: resolved_target,
+        smart_adjusted,
+    })
+}
+
+/// Extract a standard .zip archive using staged atomic transactions
+fn extract_zip_archive(
+    archive_path: &Path,
+    output_base: &Path,
+    opts: &ExtractionOptions,
+    spec: Option<&selection::SelectionSpec>,
+) -> Result<ExtractionSummary, Box<dyn std::error::Error>> {
+    let password = opts.password.as_deref();
+    let smart = opts.smart;
+    let force_subfolder = opts.to_folder;
+    let max_bytes = opts.max_bytes;
+    let flat = opts.flat;
+
+    let file = File::open(archive_path)?;
+    let mut archive = ZipArchive::new(file)?;
+    let archive_stem = archive_stem_cleaned(archive_path);
+
+    let plan = plan_smart_unpack(&mut archive, &archive_stem, output_base)?;
+    check_zip_bomb(plan.total_uncompressed_bytes, max_bytes)?;
+    let (target_dir, smart_adjusted) = if force_subfolder {
+        (output_base.join(&archive_stem), true)
+    } else if smart {
+        (plan.target_dir, !plan.has_single_root)
+    } else {
+        (output_base.to_path_buf(), false)
+    };
+
+    let (resolved_target, target_dir_existed_before) =
+        resolve_and_verify_target_dir(output_base, &target_dir)?;
+
+    let staging_token = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let staging_dir = resolved_target.join(format!(
+        ".mothzip_stage_{}_{}",
+        std::process::id(),
+        staging_token
+    ));
+    fs::create_dir(&staging_dir)?;
+
+    let mut staged_files = Vec::new();
+    let mut dirs_to_create = Vec::new();
+    let mut seen_destinations = HashSet::new();
+    let mut extracted_bytes = 0u64;
+    let mut entry_index = 0usize;
+
+    let stage_result: Result<(), Box<dyn std::error::Error>> =
+        (|| -> Result<(), Box<dyn std::error::Error>> {
+            for i in 0..archive.len() {
+                let mut entry = match password {
+                    Some(pass) => match archive.by_index_decrypt(i, pass.as_bytes()) {
+                        Ok(e) => e,
+                        Err(ZipError::UnsupportedArchive(msg)) => {
+                            return Err(format!("Decryption failed: {}", msg).into());
+                        }
+                        Err(e) => return Err(Box::new(e) as Box<dyn std::error::Error>),
+                    },
+                    None => match archive.by_index(i) {
+                        Ok(e) => e,
+                        Err(ZipError::UnsupportedArchive(msg))
+                            if msg.contains("Password") || msg.contains("encrypted") =>
+                        {
+                            return Err(
+                            "Archive entry is password-protected. Please supply --password <PASS>"
+                                .into(),
+                        );
+                        }
+                        Err(e) => return Err(Box::new(e) as Box<dyn std::error::Error>),
+                    },
+                };
+
+                if entry.is_symlink() {
+                    return Err(
+                        "Symbolic-link ZIP members are not supported; no files were committed"
+                            .into(),
+                    );
+                }
+                let identity =
+                    super::encoding::decode_entry_name_raw(entry.name_raw()).replace('\\', "/");
+                let raw_name = super::encoding::compose_hangul_nfc(&identity);
+
+                // Skip macOS/Windows system junk files (__MACOSX, .DS_Store, Thumbs.db)
+                let normalized = raw_name.replace('\\', "/");
+                if normalized.starts_with("__MACOSX/")
+                    || normalized == "__MACOSX"
+                    || normalized.ends_with("/.DS_Store")
+                    || normalized == ".DS_Store"
+                    || normalized.ends_with("/Thumbs.db")
+                    || normalized == "Thumbs.db"
+                {
+                    continue;
+                }
+
+                // Literal member selection (raw identity or directory prefix).
+                if let Some(spec) = spec {
+                    if !spec.matches(&identity) {
+                        continue;
+                    }
+                }
+
+                let raw_dest = sanitize_entry_path(&resolved_target, &raw_name)?;
+                verify_safe_ancestors(&raw_dest, &resolved_target)?;
+
+                let is_dir_entry =
+                    entry.is_dir() || raw_name.ends_with('/') || raw_name.ends_with('\\');
+
+                if is_dir_entry {
+                    if !flat {
+                        dirs_to_create.push(raw_dest);
+                    }
+                } else {
+                    let candidate = if flat {
+                        resolved_target.join(leaf_component(&raw_dest)?)
+                    } else {
+                        raw_dest
+                    };
+                    let final_dest = disambiguate_dest_path(candidate, &mut seen_destinations);
+                    verify_safe_ancestors(&final_dest, &resolved_target)?;
+
+                    let stage_file_path = staging_dir.join(format!("{}.tmp", entry_index));
+                    entry_index += 1;
+
+                    let mut outfile = File::create(&stage_file_path)?;
+
+                    let declared_size = entry.size();
+                    let written = copy_archive_entry(
+                        &mut entry,
+                        &mut outfile,
+                        Some(declared_size),
+                        extracted_bytes,
+                        max_bytes,
+                    )?;
+                    extracted_bytes += written;
+
+                    let mtime = entry.last_modified().and_then(zip_datetime_to_system_time);
+
+                    staged_files.push(StagedFile {
+                        temp_path: stage_file_path,
+                        final_dest,
+                        mtime,
+                    });
+                }
+            }
+            Ok(())
+        })();
 
     if let Err(e) = stage_result {
         let _ = fs::remove_dir_all(&staging_dir);
@@ -555,27 +1020,30 @@ fn extract_zip_archive(
 fn extract_tar_archive(
     archive_path: &Path,
     output_base: &Path,
-    is_gz: bool,
-    smart: bool,
-    force_subfolder: bool,
+    codec: Option<StreamCodec>,
+    opts: &ExtractionOptions,
+    spec: Option<&selection::SelectionSpec>,
 ) -> Result<ExtractionSummary, Box<dyn std::error::Error>> {
+    let smart = opts.smart;
+    let force_subfolder = opts.to_folder;
+    let max_bytes = opts.max_bytes;
+    let flat = opts.flat;
+
     let archive_stem = archive_stem_cleaned(archive_path);
     let archive_file_size = fs::metadata(archive_path)?.len();
 
     let (target_dir, smart_adjusted) = if force_subfolder {
         (output_base.join(&archive_stem), true)
     } else if smart {
-        let plan = if is_gz {
-            let f = File::open(archive_path)?;
-            let gz = flate2::read::GzDecoder::new(f);
-            let tar = tar::Archive::new(gz);
-            plan_smart_unpack_tar(tar, &archive_stem, output_base, archive_file_size)?
-        } else {
-            let f = File::open(archive_path)?;
-            let tar = tar::Archive::new(f);
-            plan_smart_unpack_tar(tar, &archive_stem, output_base, archive_file_size)?
-        };
-        check_zip_bomb(plan.total_uncompressed_bytes, DEFAULT_MAX_UNCOMPRESSED_BYTES)?;
+        let reader = super::format::open_tar_reader(archive_path, codec, max_bytes)?;
+        let plan = plan_smart_unpack_tar(
+            tar::Archive::new(reader),
+            &archive_stem,
+            output_base,
+            archive_file_size,
+            max_bytes,
+        )?;
+        check_zip_bomb(plan.total_uncompressed_bytes, max_bytes)?;
         (plan.target_dir, !plan.has_single_root)
     } else {
         (output_base.to_path_buf(), false)
@@ -588,15 +1056,14 @@ fn extract_tar_archive(
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let staging_dir = resolved_target.join(format!(".mothzip_stage_{}_{}", std::process::id(), staging_token));
-    fs::create_dir_all(&staging_dir)?;
+    let staging_dir = resolved_target.join(format!(
+        ".mothzip_stage_{}_{}",
+        std::process::id(),
+        staging_token
+    ));
+    fs::create_dir(&staging_dir)?;
 
-    let file = File::open(archive_path)?;
-    let reader: Box<dyn Read> = if is_gz {
-        Box::new(flate2::read::GzDecoder::new(file))
-    } else {
-        Box::new(file)
-    };
+    let reader = super::format::open_tar_reader(archive_path, codec, max_bytes)?;
     let mut tar = tar::Archive::new(reader);
 
     let mut staged_files = Vec::new();
@@ -609,10 +1076,10 @@ fn extract_tar_archive(
         for entry_res in tar.entries()? {
             let mut entry = entry_res?;
             let path_cow = entry.path()?;
-            let raw_path = path_cow.to_string_lossy().to_string();
+            let raw_path = path_cow.to_string_lossy().replace('\\', "/");
             let raw_name = crate::core::encoding::compose_hangul_nfc(&raw_path);
 
-            // Skip macOS/Windows system junk files (__MACOSX, .DS_Store, Thumbs.db, pax_global_header)
+            // Skip macOS/Windows system junk files
             let normalized = raw_name.replace('\\', "/");
             if normalized.starts_with("__MACOSX/")
                 || normalized == "__MACOSX"
@@ -627,16 +1094,31 @@ fn extract_tar_archive(
                 continue;
             }
 
+            // Literal member selection (raw identity or directory prefix).
+            if let Some(spec) = spec {
+                if !spec.matches(&raw_path) {
+                    continue;
+                }
+            }
+
             let raw_dest = sanitize_entry_path(&resolved_target, &raw_name)?;
             verify_safe_ancestors(&raw_dest, &resolved_target)?;
 
             let entry_type = entry.header().entry_type();
-            let is_dir_entry = entry_type.is_dir() || raw_name.ends_with('/') || raw_name.ends_with('\\');
+            let is_dir_entry =
+                entry_type.is_dir() || raw_name.ends_with('/') || raw_name.ends_with('\\');
 
             if is_dir_entry {
-                dirs_to_create.push(raw_dest);
+                if !flat {
+                    dirs_to_create.push(raw_dest);
+                }
             } else if entry_type.is_file() {
-                let final_dest = disambiguate_dest_path(raw_dest, &mut seen_destinations);
+                let candidate = if flat {
+                    resolved_target.join(leaf_component(&raw_dest)?)
+                } else {
+                    raw_dest
+                };
+                let final_dest = disambiguate_dest_path(candidate, &mut seen_destinations);
                 verify_safe_ancestors(&final_dest, &resolved_target)?;
 
                 let stage_file_path = staging_dir.join(format!("{}.tmp", entry_index));
@@ -644,57 +1126,38 @@ fn extract_tar_archive(
 
                 let mut outfile = File::create(&stage_file_path)?;
 
-                let entry_size = entry.header().size()?;
-                let max_entry_bytes = entry_size + 4096;
-                let mut limited = (&mut entry).take(max_entry_bytes + 1);
-                let written = io::copy(&mut limited, &mut outfile).map_err(|e| {
-                    format!("Extraction error on '{}': {}", raw_name, e)
-                })?;
-
-                if written < entry_size {
-                    return Err(format!(
-                        "Corrupt archive: entry '{}' was truncated (expected {} bytes, read {})",
-                        raw_name, entry_size, written
-                    )
-                    .into());
-                }
-
-                if written > max_entry_bytes {
-                    return Err(format!(
-                        "Security violation: entry '{}' exceeded declared size (deceptive tar-bomb detected)",
-                        raw_name
-                    )
-                    .into());
-                }
-
+                let declared_size = entry.header().size()?;
+                let written = copy_archive_entry(
+                    &mut entry,
+                    &mut outfile,
+                    Some(declared_size),
+                    extracted_bytes,
+                    max_bytes,
+                )?;
                 extracted_bytes += written;
-                if extracted_bytes > DEFAULT_MAX_UNCOMPRESSED_BYTES {
-                    return Err(format!(
-                        "Security violation: total extracted data exceeded global safety threshold ({} GB)",
-                        DEFAULT_MAX_UNCOMPRESSED_BYTES / (1024 * 1024 * 1024)
-                    )
-                    .into());
-                }
 
-                let mtime = if let Ok(mt) = entry.header().mtime() {
-                    if mt <= 253_402_300_799 {
-                        UNIX_EPOCH.checked_add(Duration::from_secs(mt))
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
+                let mtime = entry
+                    .header()
+                    .mtime()
+                    .ok()
+                    .and_then(|mt| UNIX_EPOCH.checked_add(Duration::from_secs(mt)));
 
                 staged_files.push(StagedFile {
                     temp_path: stage_file_path,
                     final_dest,
                     mtime,
                 });
+            } else {
+                return Err(format!(
+                    "Unsupported TAR member type for '{}'; no files were committed",
+                    raw_name
+                )
+                .into());
             }
         }
 
-        // Drain trailing stream to verify gzip trailer integrity (CRC32 and ISIZE)
+        // Drain the rest of the stream so the decoder validates its trailer and checksum
+        // (gzip CRC32/ISIZE, xz check, zstd content checksum when present) before we commit.
         let mut inner = tar.into_inner();
         let mut drain = io::sink();
         io::copy(&mut inner, &mut drain)?;
@@ -721,15 +1184,31 @@ fn extract_tar_archive(
     })
 }
 
-/// Extract a single .gz archive (plain gzip, multi-member compliant)
-fn extract_gz_archive(
+/// Extract a single stream archive (`.gz`, `.zst`, `.xz`, `.lz4`, `.br`) into its stem name.
+fn extract_stream_archive(
     archive_path: &Path,
     output_base: &Path,
-    _smart: bool,
-    force_subfolder: bool,
+    codec: StreamCodec,
+    opts: &ExtractionOptions,
+    spec: Option<&selection::SelectionSpec>,
 ) -> Result<ExtractionSummary, Box<dyn std::error::Error>> {
+    let max_bytes = opts.max_bytes;
     let archive_stem = archive_stem_cleaned(archive_path);
-    let target_dir = if force_subfolder {
+
+    // A bare stream's only member is its stem; selection was already validated
+    // against the catalog, so this is a consistency guard for direct callers.
+    if let Some(spec) = spec {
+        if !spec.matches(&archive_stem) {
+            return Err(format!(
+                "Requested member '{}' is not present in the {} archive",
+                archive_stem,
+                codec.name()
+            )
+            .into());
+        }
+    }
+
+    let target_dir = if opts.to_folder {
         output_base.join(&archive_stem)
     } else {
         output_base.to_path_buf()
@@ -745,22 +1224,19 @@ fn extract_gz_archive(
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let staging_dir = resolved_target.join(format!(".mothzip_stage_{}_{}", std::process::id(), staging_token));
-    fs::create_dir_all(&staging_dir)?;
+    let staging_dir = resolved_target.join(format!(
+        ".mothzip_stage_{}_{}",
+        std::process::id(),
+        staging_token
+    ));
+    fs::create_dir(&staging_dir)?;
     let stage_file_path = staging_dir.join("0.tmp");
 
-    let file = File::open(archive_path)?;
-    let mut gz = flate2::read::MultiGzDecoder::new(file);
+    let mut reader = super::codec::decoder(File::open(archive_path)?, codec)?;
 
     let stage_result: Result<u64, Box<dyn std::error::Error>> = (|| {
         let mut outfile = File::create(&stage_file_path)?;
-        let mut limited = (&mut gz).take(DEFAULT_MAX_UNCOMPRESSED_BYTES + 1);
-        let written = io::copy(&mut limited, &mut outfile)?;
-        if written > DEFAULT_MAX_UNCOMPRESSED_BYTES {
-            return Err("Security violation: total extracted data exceeded global safety threshold".into());
-        }
-        let mut drain = io::sink();
-        io::copy(&mut gz, &mut drain)?;
+        let written = copy_archive_entry(&mut reader, &mut outfile, None, 0, max_bytes)?;
         Ok(written)
     })();
 
@@ -787,7 +1263,7 @@ fn extract_gz_archive(
         extracted_files: 1,
         extracted_bytes,
         target_dir: resolved_target,
-        smart_adjusted: force_subfolder,
+        smart_adjusted: opts.to_folder,
     })
 }
 
@@ -797,6 +1273,99 @@ mod tests {
     use std::io::Cursor;
     use zip::write::SimpleFileOptions;
     use zip::ZipWriter;
+
+    #[test]
+    fn aes_passwords_and_authenticated_corruption_preserve_existing_files() {
+        for (index, mode) in [zip::AesMode::Aes128, zip::AesMode::Aes256]
+            .into_iter()
+            .enumerate()
+        {
+            let dir = PathBuf::from("target").join(format!(
+                "aes_fixture_{}_{}_{}",
+                std::process::id(),
+                index,
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            fs::create_dir_all(&dir).unwrap();
+            let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+            let options = SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored)
+                .with_aes_encryption(mode, "fixture-only");
+            writer.start_file("secret.txt", options).unwrap();
+            std::io::Write::write_all(&mut writer, b"AUTHENTICATED CONTENT").unwrap();
+            let bytes = writer.finish().unwrap().into_inner();
+            let archive = dir.join("valid.zip");
+            fs::write(&archive, &bytes).unwrap();
+            let out = dir.join("out");
+            extract_archive(
+                &archive,
+                &out,
+                false,
+                false,
+                Some("fixture-only"),
+                crate::core::guard::DEFAULT_MAX_UNCOMPRESSED_BYTES,
+            )
+            .unwrap();
+            assert_eq!(
+                fs::read(out.join("secret.txt")).unwrap(),
+                b"AUTHENTICATED CONTENT"
+            );
+            let smart = extract_archive(
+                &archive,
+                &dir.join("smart"),
+                true,
+                false,
+                Some("fixture-only"),
+                crate::core::guard::DEFAULT_MAX_UNCOMPRESSED_BYTES,
+            )
+            .unwrap();
+            assert_eq!(
+                fs::read(smart.target_dir.join("secret.txt")).unwrap(),
+                b"AUTHENTICATED CONTENT"
+            );
+            let mut cat = Vec::new();
+            crate::core::inspect::cat_archive_file(
+                &archive,
+                "secret.txt",
+                Some("fixture-only"),
+                &mut cat,
+                crate::core::guard::DEFAULT_MAX_UNCOMPRESSED_BYTES,
+            )
+            .unwrap();
+            assert_eq!(cat, b"AUTHENTICATED CONTENT");
+            fs::write(out.join("secret.txt"), b"ORIGINAL").unwrap();
+            assert!(extract_archive(
+                &archive,
+                &out,
+                false,
+                false,
+                Some("wrong-fixture"),
+                crate::core::guard::DEFAULT_MAX_UNCOMPRESSED_BYTES,
+            )
+            .is_err());
+            assert_eq!(fs::read(out.join("secret.txt")).unwrap(), b"ORIGINAL");
+            let mut parsed = ZipArchive::new(Cursor::new(&bytes)).unwrap();
+            let offset = parsed.by_index_raw(0).unwrap().data_start().unwrap() as usize;
+            let mut corrupt = bytes.clone();
+            let salt_length = if index == 0 { 8 } else { 16 };
+            corrupt[offset + salt_length + 2 + 1] ^= 1;
+            let bad = dir.join("corrupt.zip");
+            fs::write(&bad, corrupt).unwrap();
+            assert!(extract_archive(
+                &bad,
+                &out,
+                false,
+                false,
+                Some("fixture-only"),
+                crate::core::guard::DEFAULT_MAX_UNCOMPRESSED_BYTES,
+            )
+            .is_err());
+            assert_eq!(fs::read(out.join("secret.txt")).unwrap(), b"ORIGINAL");
+        }
+    }
 
     #[test]
     fn test_timestamp_preservation() {
@@ -822,7 +1391,15 @@ mod tests {
         let zip_path = temp_dir.join("test_time.zip");
         fs::write(&zip_path, buf).unwrap();
 
-        let res = extract_archive(&zip_path, &temp_dir, false, false, None).unwrap();
+        let res = extract_archive(
+            &zip_path,
+            &temp_dir,
+            false,
+            false,
+            None,
+            crate::core::guard::DEFAULT_MAX_UNCOMPRESSED_BYTES,
+        )
+        .unwrap();
         assert_eq!(res.extracted_files, 1);
 
         let extracted_file = temp_dir.join("timed.txt");
@@ -883,7 +1460,15 @@ mod tests {
         fs::write(&targz_path, gz_buf).unwrap();
 
         // 1. Test smart-unpack (single root folder 'my_crate' -> extracts directly to temp_dir without double folder)
-        let res = extract_archive(&targz_path, &temp_dir, true, false, None).unwrap();
+        let res = extract_archive(
+            &targz_path,
+            &temp_dir,
+            true,
+            false,
+            None,
+            crate::core::guard::DEFAULT_MAX_UNCOMPRESSED_BYTES,
+        )
+        .unwrap();
         assert_eq!(res.extracted_files, 2);
         assert!(
             !res.smart_adjusted,
@@ -906,6 +1491,7 @@ mod tests {
             "my_crate/Cargo.toml",
             None,
             &mut cat_out,
+            crate::core::guard::DEFAULT_MAX_UNCOMPRESSED_BYTES,
         )
         .unwrap();
         assert_eq!(
@@ -914,12 +1500,349 @@ mod tests {
         );
 
         // 3. Test peek on the tar.gz
-        let peek = crate::core::inspect::peek_archive(&targz_path, 2, 50).unwrap();
+        let peek = crate::core::inspect::peek_archive(
+            &targz_path,
+            2,
+            50,
+            crate::core::guard::DEFAULT_MAX_UNCOMPRESSED_BYTES,
+        )
+        .unwrap();
         assert_eq!(peek.total_entries, 2);
         assert!(peek.has_single_root);
         assert_eq!(peek.root_name.as_deref(), Some("my_crate"));
 
         let _ = fs::remove_file(targz_path);
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_7z_extraction_and_smart_unpack() {
+        let temp_dir = PathBuf::from("target").join(format!(
+            "test_7z_extract_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::create_dir_all(&temp_dir);
+
+        let root_dir = temp_dir.join("single_root");
+        let src_dir = root_dir.join("src");
+        fs::create_dir_all(&src_dir).unwrap();
+        let file1 = src_dir.join("lib.rs");
+        fs::write(&file1, b"pub fn add(a: i32, b: i32) -> i32 { a + b }").unwrap();
+
+        let sz_path = temp_dir.join("project.7z");
+        crate::core::pack::pack_archive(&sz_path, &[root_dir]).unwrap();
+
+        let out_dir = temp_dir.join("unpacked");
+        let res = extract_archive(
+            &sz_path,
+            &out_dir,
+            true,
+            false,
+            None,
+            crate::core::guard::DEFAULT_MAX_UNCOMPRESSED_BYTES,
+        )
+        .unwrap();
+        assert_eq!(res.extracted_files, 1);
+        assert!(
+            !res.smart_adjusted,
+            "Single root folder should not create wrapper"
+        );
+        assert!(out_dir
+            .join("single_root")
+            .join("src")
+            .join("lib.rs")
+            .exists());
+        assert_eq!(
+            fs::read(out_dir.join("single_root").join("src").join("lib.rs")).unwrap(),
+            b"pub fn add(a: i32, b: i32) -> i32 { a + b }"
+        );
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_7z_encryption_lifecycle() {
+        let temp_dir = PathBuf::from("target").join(format!(
+            "test_7z_enc_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::create_dir_all(&temp_dir);
+        let secret_file = temp_dir.join("secret.txt");
+        fs::write(&secret_file, b"TOP_SECRET_7Z_DATA").unwrap();
+
+        let sz_path = temp_dir.join("secret.7z");
+        let options = crate::core::pack::PackOptions {
+            level: Some(5),
+            password: Some("my-7z-pass"),
+            format: Some(ArchiveFormat::SevenZ),
+        };
+        crate::core::pack::pack_archive_with_options(&sz_path, &[secret_file], options).unwrap();
+
+        let out_dir = temp_dir.join("out");
+        // Extract without password fails
+        assert!(extract_archive(
+            &sz_path,
+            &out_dir,
+            false,
+            false,
+            None,
+            crate::core::guard::DEFAULT_MAX_UNCOMPRESSED_BYTES,
+        )
+        .is_err());
+        assert!(!out_dir.join("secret.txt").exists());
+
+        // Extract with wrong password fails
+        assert!(extract_archive(
+            &sz_path,
+            &out_dir,
+            false,
+            false,
+            Some("wrong-pass"),
+            crate::core::guard::DEFAULT_MAX_UNCOMPRESSED_BYTES,
+        )
+        .is_err());
+        assert!(!out_dir.join("secret.txt").exists());
+
+        // Extract with correct password succeeds
+        let res = extract_archive(
+            &sz_path,
+            &out_dir,
+            false,
+            false,
+            Some("my-7z-pass"),
+            crate::core::guard::DEFAULT_MAX_UNCOMPRESSED_BYTES,
+        )
+        .unwrap();
+        assert_eq!(res.extracted_files, 1);
+        assert_eq!(
+            fs::read(out_dir.join("secret.txt")).unwrap(),
+            b"TOP_SECRET_7Z_DATA"
+        );
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_rar5_extraction_and_smart_unpack() {
+        let temp_dir = PathBuf::from("target").join(format!(
+            "test_rar5_extract_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::create_dir_all(&temp_dir);
+
+        let rar_path = temp_dir.join("test_rar5.rar");
+        let mut builder = rars::Builder::new(rars::ArchiveVersion::Rar50);
+        builder.add_directory(b"app".to_vec(), None, None).unwrap();
+        builder
+            .add_bytes(
+                b"app/config.yaml".to_vec(),
+                b"version: 1.0".to_vec(),
+                None,
+                None,
+            )
+            .unwrap();
+        builder
+            .add_bytes(b"app/run.sh".to_vec(), b"echo hello".to_vec(), None, None)
+            .unwrap();
+        builder.write_to_path(&rar_path, None).unwrap();
+
+        let out_dir = temp_dir.join("unpacked");
+        let res = extract_archive(
+            &rar_path,
+            &out_dir,
+            true,
+            false,
+            None,
+            crate::core::guard::DEFAULT_MAX_UNCOMPRESSED_BYTES,
+        )
+        .unwrap();
+        assert_eq!(res.extracted_files, 2);
+        assert!(
+            !res.smart_adjusted,
+            "Single root folder app should not create redundant wrapper"
+        );
+        assert_eq!(
+            fs::read_to_string(out_dir.join("app").join("config.yaml")).unwrap(),
+            "version: 1.0"
+        );
+        assert_eq!(
+            fs::read_to_string(out_dir.join("app").join("run.sh")).unwrap(),
+            "echo hello"
+        );
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_rar4_legacy_extraction() {
+        let temp_dir = PathBuf::from("target").join(format!(
+            "test_rar4_extract_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::create_dir_all(&temp_dir);
+
+        let rar_path = temp_dir.join("legacy_v4.rar");
+        let mut builder = rars::Builder::new(rars::ArchiveVersion::Rar40);
+        builder
+            .add_bytes(
+                b"readme.txt".to_vec(),
+                b"Legacy RAR4 text".to_vec(),
+                None,
+                None,
+            )
+            .unwrap();
+        builder.write_to_path(&rar_path, None).unwrap();
+
+        let out_dir = temp_dir.join("out");
+        let res = extract_archive(
+            &rar_path,
+            &out_dir,
+            false,
+            false,
+            None,
+            crate::core::guard::DEFAULT_MAX_UNCOMPRESSED_BYTES,
+        )
+        .unwrap();
+        assert_eq!(res.extracted_files, 1);
+        assert_eq!(
+            fs::read(out_dir.join("readme.txt")).unwrap(),
+            b"Legacy RAR4 text"
+        );
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_rar_encryption_lifecycle() {
+        let temp_dir = PathBuf::from("target").join(format!(
+            "test_rar_enc_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::create_dir_all(&temp_dir);
+
+        let rar_path = temp_dir.join("encrypted.rar");
+        let mut builder = rars::Builder::new(rars::ArchiveVersion::Rar50);
+        builder
+            .add_bytes(
+                b"confidential.txt".to_vec(),
+                b"RESTRICTED CONTENT".to_vec(),
+                None,
+                None,
+            )
+            .unwrap();
+        builder
+            .set_entry_encryption(b"confidential.txt", Some(b"rar-secret".to_vec()), None)
+            .unwrap();
+        builder.write_to_path(&rar_path, None).unwrap();
+
+        let out_dir = temp_dir.join("out");
+        // Pre-create destination file to test rollback / preservation
+        fs::create_dir_all(&out_dir).unwrap();
+        fs::write(out_dir.join("confidential.txt"), b"ORIGINAL PRESERVED").unwrap();
+
+        // 1. Without password fails and preserves original
+        let err1 = extract_archive(
+            &rar_path,
+            &out_dir,
+            false,
+            false,
+            None,
+            crate::core::guard::DEFAULT_MAX_UNCOMPRESSED_BYTES,
+        );
+        assert!(err1.is_err());
+        assert_eq!(
+            fs::read(out_dir.join("confidential.txt")).unwrap(),
+            b"ORIGINAL PRESERVED"
+        );
+
+        // 2. With wrong password fails and preserves original
+        let err2 = extract_archive(
+            &rar_path,
+            &out_dir,
+            false,
+            false,
+            Some("wrong"),
+            crate::core::guard::DEFAULT_MAX_UNCOMPRESSED_BYTES,
+        );
+        assert!(err2.is_err());
+        assert_eq!(
+            fs::read(out_dir.join("confidential.txt")).unwrap(),
+            b"ORIGINAL PRESERVED"
+        );
+
+        // 3. With correct password succeeds and updates destination
+        let ok = extract_archive(
+            &rar_path,
+            &out_dir,
+            false,
+            false,
+            Some("rar-secret"),
+            crate::core::guard::DEFAULT_MAX_UNCOMPRESSED_BYTES,
+        )
+        .unwrap();
+        assert_eq!(ok.extracted_files, 1);
+        assert_eq!(
+            fs::read(out_dir.join("confidential.txt")).unwrap(),
+            b"RESTRICTED CONTENT"
+        );
+
+        let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_rar_adversarial_zip_slip_rejection() {
+        let temp_dir = PathBuf::from("target").join(format!(
+            "test_rar_slip_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::create_dir_all(&temp_dir);
+
+        let rar_path = temp_dir.join("slip.rar");
+        let mut builder = rars::Builder::new(rars::ArchiveVersion::Rar50);
+        let add_res =
+            builder.add_bytes(b"../escape.txt".to_vec(), b"malicious".to_vec(), None, None);
+        if add_res.is_ok() {
+            let _ = builder.write_to_path(&rar_path, None);
+            let out_dir = temp_dir.join("target_dir");
+            let outside_file = temp_dir.join("escape.txt");
+            let _ = extract_archive(
+                &rar_path,
+                &out_dir,
+                false,
+                false,
+                None,
+                crate::core::guard::DEFAULT_MAX_UNCOMPRESSED_BYTES,
+            );
+            assert!(
+                !outside_file.exists(),
+                "ZipSlip traversal file must never be created outside target"
+            );
+        }
+
         let _ = fs::remove_dir_all(temp_dir);
     }
 }

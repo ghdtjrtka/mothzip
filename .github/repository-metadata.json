@@ -1,0 +1,6 @@
+{
+  "name": "mothzip",
+  "description": "Ad-free Windows archive CLI with JSON output: ZIP, 7z, TAR and gzip/zstd/xz/lz4/brotli creation, RAR extraction, ZIP/7z editing, reproducible output, a double-click archive browser, SFX, and Explorer menus.",
+  "topics": ["archiver", "cli", "windows", "rust", "zip", "7zip", "rar", "tar", "zstd", "brotli", "gzip", "sfx", "reproducible-builds", "archive-browser", "automation", "ai-agents", "open-source"],
+  "license": "MIT"
+}
