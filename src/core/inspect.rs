@@ -49,7 +49,7 @@ pub fn peek_archive(
 
     for i in 0..archive.len() {
         let entry = archive.by_index(i)?;
-        let name = entry.name().replace('\\', "/");
+        let name = super::encoding::decode_entry_name(entry.name_raw()).replace('\\', "/");
         let is_dir = entry.is_dir() || name.ends_with('/');
         let size = entry.size();
 
@@ -120,7 +120,7 @@ pub fn cat_archive_file<W: Write>(
     // Try exact match first
     for i in 0..archive.len() {
         let mut entry = archive.by_index(i)?;
-        let name_normalized = entry.name().replace('\\', "/");
+        let name_normalized = super::encoding::decode_entry_name(entry.name_raw()).replace('\\', "/");
 
         if name_normalized == target_normalized
             || name_normalized.trim_start_matches('/') == target_normalized.trim_start_matches('/')
@@ -136,7 +136,7 @@ pub fn cat_archive_file<W: Write>(
     // Try case-insensitive fallback
     for i in 0..archive.len() {
         let mut entry = archive.by_index(i)?;
-        let name_normalized = entry.name().replace('\\', "/");
+        let name_normalized = super::encoding::decode_entry_name(entry.name_raw()).replace('\\', "/");
 
         if name_normalized.eq_ignore_ascii_case(&target_normalized) {
             if entry.is_dir() {

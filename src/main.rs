@@ -80,10 +80,8 @@ fn main() -> ExitCode {
         Ok(_) => ExitCode::SUCCESS,
         Err(err) => {
             if cli.json {
-                eprintln!(
-                    r#"{{"error": "{}"}}"#,
-                    err.to_string().replace('"', "\\\"")
-                );
+                let json_err = serde_json::json!({ "error": err.to_string() });
+                eprintln!("{}", json_err);
             } else {
                 eprintln!("Error: {}", err);
             }

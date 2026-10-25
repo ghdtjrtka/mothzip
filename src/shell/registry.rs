@@ -18,11 +18,6 @@ pub fn generate_reg_content(exe_path: &Path) -> String {
 @=\"여기에 풀기\"\r\n\r\n\
 [HKEY_CURRENT_USER\\Software\\Classes\\.zip\\shell\\MothZip.UnpackHere\\command]\r\n\
 @=\"\\\"{exe_str}\\\" unpack \\\"%1\\\"\"\r\n\r\n\
-[HKEY_CURRENT_USER\\Software\\Classes\\.7z\\shell\\MothZip.SmartUnpack]\r\n\
-@=\"알아서 풀기 (&MothZip)\"\r\n\
-\"Icon\"=\"\\\"{exe_str}\\\",0\"\r\n\r\n\
-[HKEY_CURRENT_USER\\Software\\Classes\\.7z\\shell\\MothZip.SmartUnpack\\command]\r\n\
-@=\"\\\"{exe_str}\\\" smart-unpack \\\"%1\\\"\"\r\n\r\n\
 [HKEY_CURRENT_USER\\Software\\Classes\\Directory\\shell\\MothZip.Pack]\r\n\
 @=\"ZIP으로 압축 (&MothZip)\"\r\n\
 \"Icon\"=\"\\\"{exe_str}\\\",0\"\r\n\r\n\
@@ -36,7 +31,6 @@ pub fn generate_unreg_content() -> &'static str {
     "Windows Registry Editor Version 5.00\r\n\r\n\
 [-HKEY_CURRENT_USER\\Software\\Classes\\.zip\\shell\\MothZip.SmartUnpack]\r\n\
 [-HKEY_CURRENT_USER\\Software\\Classes\\.zip\\shell\\MothZip.UnpackHere]\r\n\
-[-HKEY_CURRENT_USER\\Software\\Classes\\.7z\\shell\\MothZip.SmartUnpack]\r\n\
 [-HKEY_CURRENT_USER\\Software\\Classes\\Directory\\shell\\MothZip.Pack]\r\n"
 }
 
@@ -72,7 +66,7 @@ pub fn register_context_menu() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("✓ Successfully registered MothZip in Windows Explorer context menu!");
     println!("  Config: {}", reg_path.display());
-    println!("  - Right click on .zip / .7z: '알아서 풀기 (&MothZip)' & '여기에 풀기'");
+    println!("  - Right click on .zip: '알아서 풀기 (&MothZip)' & '여기에 풀기'");
     println!("  - Right click on folder: 'ZIP으로 압축 (&MothZip)'");
     Ok(())
 }

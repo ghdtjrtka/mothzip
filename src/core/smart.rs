@@ -39,7 +39,7 @@ pub fn plan_smart_unpack<R: Read + Seek>(
         total_uncompressed_bytes += entry.size();
         total_compressed_bytes += entry.compressed_size();
 
-        let raw_name = entry.name().replace('\\', "/");
+        let raw_name = crate::core::encoding::decode_entry_name(entry.name_raw()).replace('\\', "/");
         let trimmed = raw_name.trim_matches('/');
         if trimmed.is_empty() {
             continue;

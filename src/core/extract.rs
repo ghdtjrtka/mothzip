@@ -1,5 +1,5 @@
 use std::fs::{self, File};
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use zip::ZipArchive;
 
@@ -46,9 +46,24 @@ pub fn extract_archive(
 
     for i in 0..archive.len() {
         let mut entry = archive.by_index(i)?;
-        let raw_name = entry.name().to_string();
+        let raw_name = super::encoding::decode_entry_name(entry.name_raw());
 
         let dest_path = sanitize_entry_path(&target_dir, &raw_name)?;
+
+        // Defense against Symlink / Junction redirection
+        if let Some(parent) = dest_path.parent() {
+            if parent.exists() && parent != target_dir {
+                if let Ok(meta) = fs::symlink_metadata(parent) {
+                    if meta.file_type().is_symlink() {
+                        return Err(format!(
+                            "Security violation: parent path '{}' is a symlink",
+                            parent.display()
+                        )
+                        .into());
+                    }
+                }
+            }
+        }
 
         if entry.is_dir() || raw_name.ends_with('/') || raw_name.ends_with('\\') {
             fs::create_dir_all(&dest_path)?;
@@ -60,8 +75,32 @@ pub fn extract_archive(
             }
 
             let mut outfile = File::create(&dest_path)?;
-            let written = io::copy(&mut entry, &mut outfile)?;
+
+            // Defend against deceptive stream zip-bombs:
+            // Cap extraction by declared entry size + 4KB safety slack
+            let max_entry_bytes = entry.size() + 4096;
+            let mut limited = (&mut entry).take(max_entry_bytes + 1);
+            let written = io::copy(&mut limited, &mut outfile)?;
+
+            if written > max_entry_bytes {
+                let _ = fs::remove_file(&dest_path);
+                return Err(format!(
+                    "Security violation: entry '{}' exceeded declared size (deceptive zip-bomb detected)",
+                    raw_name
+                )
+                .into());
+            }
+
             extracted_bytes += written;
+            if extracted_bytes > DEFAULT_MAX_UNCOMPRESSED_BYTES {
+                let _ = fs::remove_file(&dest_path);
+                return Err(format!(
+                    "Security violation: total extracted data exceeded global safety threshold ({} GB)",
+                    DEFAULT_MAX_UNCOMPRESSED_BYTES / (1024 * 1024 * 1024)
+                )
+                .into());
+            }
+
             extracted_files += 1;
         }
     }
