@@ -244,9 +244,25 @@ pub fn pack_archive(
         drop(finished_file);
 
         if dest_zip.exists() {
-            let _ = fs::remove_file(dest_zip);
+            let backup_path = parent.join(format!(
+                ".mothzip_bak_{}_{}_{}",
+                std::process::id(),
+                staging_token,
+                file_name
+            ));
+            fs::rename(dest_zip, &backup_path)?;
+            match fs::rename(&staging_zip, dest_zip) {
+                Ok(_) => {
+                    let _ = fs::remove_file(&backup_path);
+                }
+                Err(e) => {
+                    let _ = fs::rename(&backup_path, dest_zip);
+                    return Err(e.into());
+                }
+            }
+        } else {
+            fs::rename(&staging_zip, dest_zip)?;
         }
-        fs::rename(&staging_zip, dest_zip)?;
 
         let ratio_num = if compressed_bytes > 0 {
             total_uncompressed_bytes as f64 / compressed_bytes as f64

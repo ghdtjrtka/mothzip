@@ -29,6 +29,17 @@ pub struct PeekSummary {
     pub truncated_items: usize,
 }
 
+/// Truncate strings exceeding `max_len` characters to strictly bound AI token budgets.
+fn truncate_str_for_display(s: &str, max_len: usize) -> String {
+    if s.len() <= max_len {
+        s.to_string()
+    } else {
+        let prefix_len = (max_len / 2).saturating_sub(2);
+        let suffix_len = (max_len / 2).saturating_sub(2);
+        format!("{}...{}", &s[..prefix_len], &s[s.len() - suffix_len..])
+    }
+}
+
 fn bound_extension_distribution(
     raw: BTreeMap<String, usize>,
     limit: usize,
@@ -73,22 +84,23 @@ pub fn peek_archive(
 fn peek_gz_archive(archive_path: &Path) -> Result<PeekSummary, Box<dyn std::error::Error>> {
     let compressed_bytes = fs::metadata(archive_path)?.len();
     let file = File::open(archive_path)?;
-    let mut gz = flate2::read::GzDecoder::new(file);
+    let mut gz = flate2::read::MultiGzDecoder::new(file);
 
     let inner_name = archive_stem_cleaned(archive_path);
     let mut sink = io::sink();
     let uncompressed_bytes = io::copy(&mut gz, &mut sink)?;
 
     let mut extension_distribution = BTreeMap::new();
-    let ext = Path::new(&inner_name)
+    let ext_raw = Path::new(&inner_name)
         .extension()
         .and_then(|e| e.to_str())
         .map(|e| format!(".{}", e.to_lowercase()))
         .unwrap_or_else(|| "(no ext)".to_string());
+    let ext = truncate_str_for_display(&ext_raw, 32);
     extension_distribution.insert(ext, 1);
 
     let tree_summary = vec![TreeSummaryItem {
-        path: inner_name,
+        path: truncate_str_for_display(&inner_name, 128),
         is_dir: false,
         size: uncompressed_bytes,
     }];
@@ -141,11 +153,12 @@ fn peek_zip_archive(
 
         // Track extension distribution for files
         if !is_dir {
-            let ext = Path::new(&name)
+            let ext_raw = Path::new(&name)
                 .extension()
                 .and_then(|e| e.to_str())
                 .map(|e| format!(".{}", e.to_lowercase()))
                 .unwrap_or_else(|| "(no ext)".to_string());
+            let ext = truncate_str_for_display(&ext_raw, 32);
             *extension_distribution.entry(ext).or_insert(0) += 1;
         }
 
@@ -154,7 +167,7 @@ fn peek_zip_archive(
         if depth <= depth_limit {
             if tree_summary.len() < count_limit {
                 tree_summary.push(TreeSummaryItem {
-                    path: name,
+                    path: truncate_str_for_display(&name, 128),
                     is_dir,
                     size,
                 });
@@ -231,11 +244,12 @@ fn peek_tar_archive(
         let size = entry.header().size()?;
 
         if !is_dir {
-            let ext = Path::new(&name)
+            let ext_raw = Path::new(&name)
                 .extension()
                 .and_then(|e| e.to_str())
                 .map(|e| format!(".{}", e.to_lowercase()))
                 .unwrap_or_else(|| "(no ext)".to_string());
+            let ext = truncate_str_for_display(&ext_raw, 32);
             *extension_distribution.entry(ext).or_insert(0) += 1;
         }
 
@@ -243,7 +257,7 @@ fn peek_tar_archive(
         if depth <= depth_limit {
             if tree_summary.len() < count_limit {
                 tree_summary.push(TreeSummaryItem {
-                    path: name,
+                    path: truncate_str_for_display(&name, 128),
                     is_dir,
                     size,
                 });
@@ -302,7 +316,7 @@ fn cat_gz_file<W: Write>(
     writer: &mut W,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let file = File::open(archive_path)?;
-    let mut gz = flate2::read::GzDecoder::new(file);
+    let mut gz = flate2::read::MultiGzDecoder::new(file);
     io::copy(&mut gz, writer)?;
     Ok(())
 }
@@ -319,52 +333,70 @@ fn cat_zip_file<W: Write>(
     let target_raw = target_entry_path.replace('\\', "/");
     let target_normalized = crate::core::encoding::compose_hangul_nfc(&target_raw);
 
-    for i in 0..archive.len() {
-        let mut entry = match password {
-            Some(pass) => match archive.by_index_decrypt(i, pass.as_bytes()) {
-                Ok(e) => e,
-                Err(ZipError::UnsupportedArchive(msg)) => {
-                    return Err(format!("Decryption failed: {}", msg).into());
-                }
-                Err(e) => return Err(Box::new(e)),
-            },
-            None => match archive.by_index(i) {
-                Ok(e) => e,
-                Err(ZipError::UnsupportedArchive(msg))
-                    if msg.contains("Password") || msg.contains("encrypted") =>
-                {
-                    return Err(
-                        "File is password-protected. Please supply --password <PASS>".into(),
-                    );
-                }
-                Err(e) => return Err(Box::new(e)),
-            },
-        };
+    // Pass 1: Find best matching entry index by metadata WITHOUT decrypting
+    let mut exact_match = None;
+    let mut normalized_match = None;
+    let mut case_match = None;
 
-        let name_raw =
-            super::encoding::decode_entry_name(entry.name_raw()).replace('\\', "/");
+    for i in 0..archive.len() {
+        let name_str = archive.name_for_index(i).unwrap_or("");
+        let name_raw = name_str.replace('\\', "/");
         let name_normalized = crate::core::encoding::compose_hangul_nfc(&name_raw);
 
-        if name_raw == target_raw
-            || name_normalized == target_normalized
-            || name_normalized.trim_start_matches('/') == target_normalized.trim_start_matches('/')
-            || name_normalized.eq_ignore_ascii_case(&target_normalized)
+        if name_raw == target_raw {
+            exact_match = Some(i);
+            break;
+        }
+        if normalized_match.is_none()
+            && (name_normalized == target_normalized
+                || name_normalized.trim_start_matches('/') == target_normalized.trim_start_matches('/'))
         {
-            if entry.is_dir() {
-                return Err(format!("'{}' is a directory, not a file", target_entry_path).into());
-            }
-
-            std::io::copy(&mut entry, writer)?;
-            return Ok(());
+            normalized_match = Some(i);
+        }
+        if case_match.is_none() && name_normalized.eq_ignore_ascii_case(&target_normalized) {
+            case_match = Some(i);
         }
     }
 
-    Err(format!(
-        "File '{}' not found inside archive '{}'",
-        target_entry_path,
-        archive_path.display()
-    )
-    .into())
+    let chosen_idx = exact_match
+        .or(normalized_match)
+        .or(case_match)
+        .ok_or_else(|| {
+            format!(
+                "File '{}' not found inside archive '{}'",
+                target_entry_path,
+                archive_path.display()
+            )
+        })?;
+
+    // Pass 2: Decrypt and stream ONLY the chosen index
+    let mut entry = match password {
+        Some(pass) => match archive.by_index_decrypt(chosen_idx, pass.as_bytes()) {
+            Ok(e) => e,
+            Err(ZipError::UnsupportedArchive(msg)) => {
+                return Err(format!("Decryption failed: {}", msg).into());
+            }
+            Err(e) => return Err(Box::new(e)),
+        },
+        None => match archive.by_index(chosen_idx) {
+            Ok(e) => e,
+            Err(ZipError::UnsupportedArchive(msg))
+                if msg.contains("Password") || msg.contains("encrypted") =>
+            {
+                return Err(
+                    "File is password-protected. Please supply --password <PASS>".into(),
+                );
+            }
+            Err(e) => return Err(Box::new(e)),
+        },
+    };
+
+    if entry.is_dir() {
+        return Err(format!("'{}' is a directory, not a file", target_entry_path).into());
+    }
+
+    io::copy(&mut entry, writer)?;
+    Ok(())
 }
 
 fn cat_tar_file<W: Write>(
@@ -373,33 +405,56 @@ fn cat_tar_file<W: Write>(
     target_entry_path: &str,
     writer: &mut W,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let target_raw = target_entry_path.replace('\\', "/");
+    let target_normalized = crate::core::encoding::compose_hangul_nfc(&target_raw);
+
+    // Pass 1: exact match
     let file = File::open(archive_path)?;
     let reader: Box<dyn Read> = if is_gz {
-        Box::new(flate2::read::GzDecoder::new(file))
+        Box::new(flate2::read::MultiGzDecoder::new(file))
     } else {
         Box::new(file)
     };
     let mut tar = tar::Archive::new(reader);
-    let target_raw = target_entry_path.replace('\\', "/");
-    let target_normalized = crate::core::encoding::compose_hangul_nfc(&target_raw);
 
     for entry_res in tar.entries()? {
         let mut entry = entry_res?;
         let path_cow = entry.path()?;
         let raw_name = path_cow.to_string_lossy().to_string();
         let name_raw = raw_name.replace('\\', "/");
-        let name_normalized =
-            crate::core::encoding::compose_hangul_nfc(&name_raw);
 
-        if name_raw == target_raw
-            || name_normalized == target_normalized
+        if name_raw == target_raw {
+            if entry.header().entry_type().is_dir() {
+                return Err(format!("'{}' is a directory, not a file", target_entry_path).into());
+            }
+            io::copy(&mut entry, writer)?;
+            return Ok(());
+        }
+    }
+
+    // Pass 2: normalized / case-insensitive fallback match
+    let file2 = File::open(archive_path)?;
+    let reader2: Box<dyn Read> = if is_gz {
+        Box::new(flate2::read::MultiGzDecoder::new(file2))
+    } else {
+        Box::new(file2)
+    };
+    let mut tar2 = tar::Archive::new(reader2);
+
+    for entry_res in tar2.entries()? {
+        let mut entry = entry_res?;
+        let path_cow = entry.path()?;
+        let raw_name = path_cow.to_string_lossy().to_string();
+        let name_raw = raw_name.replace('\\', "/");
+        let name_normalized = crate::core::encoding::compose_hangul_nfc(&name_raw);
+
+        if name_normalized == target_normalized
             || name_normalized.trim_start_matches('/') == target_normalized.trim_start_matches('/')
             || name_normalized.eq_ignore_ascii_case(&target_normalized)
         {
             if entry.header().entry_type().is_dir() {
                 return Err(format!("'{}' is a directory, not a file", target_entry_path).into());
             }
-
             io::copy(&mut entry, writer)?;
             return Ok(());
         }

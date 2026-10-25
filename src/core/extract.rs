@@ -48,6 +48,46 @@ pub fn zip_datetime_to_system_time(dt: zip::DateTime) -> Option<SystemTime> {
     }
 }
 
+/// Resolve and strictly verify the target extraction directory against the caller's base output directory.
+/// Guards against junction/symlink redirection where target_dir points outside output_base.
+fn resolve_and_verify_target_dir(
+    output_base: &Path,
+    target_dir: &Path,
+) -> Result<(PathBuf, bool), Box<dyn std::error::Error>> {
+    if !output_base.exists() {
+        fs::create_dir_all(output_base)?;
+    }
+    let resolved_base = output_base.canonicalize().unwrap_or_else(|_| output_base.to_path_buf());
+
+    let target_dir_existed_before = target_dir.exists();
+    if target_dir_existed_before {
+        if let Ok(meta) = fs::symlink_metadata(target_dir) {
+            if meta.file_type().is_symlink() {
+                return Err(format!(
+                    "Security violation: destination directory '{}' is a junction or symlink",
+                    target_dir.display()
+                )
+                .into());
+            }
+        }
+    }
+
+    fs::create_dir_all(target_dir)?;
+
+    let resolved_target = target_dir.canonicalize().unwrap_or_else(|_| target_dir.to_path_buf());
+
+    if !resolved_target.starts_with(&resolved_base) {
+        return Err(format!(
+            "Security violation: destination directory '{}' resolves outside base directory '{}'",
+            target_dir.display(),
+            output_base.display()
+        )
+        .into());
+    }
+
+    Ok((resolved_target, target_dir_existed_before))
+}
+
 /// Verify that no ancestor directory of `dest_path` is a symlink or junction escaping `resolved_target`.
 fn verify_safe_ancestors(dest_path: &Path, resolved_target: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let mut curr = dest_path.parent();
@@ -87,13 +127,25 @@ fn verify_safe_ancestors(dest_path: &Path, resolved_target: &Path) -> Result<(),
     Ok(())
 }
 
+#[cfg(windows)]
+fn path_collision_key(p: &Path) -> String {
+    p.to_string_lossy().to_lowercase()
+}
+
+#[cfg(not(windows))]
+fn path_collision_key(p: &Path) -> PathBuf {
+    p.to_path_buf()
+}
+
 /// Disambiguate destination path if distinct archive entries normalize/sanitize to the same path.
+/// Respects case-insensitivity on Windows filesystem.
 fn disambiguate_dest_path(
     candidate: PathBuf,
-    seen_destinations: &mut HashSet<PathBuf>,
+    seen_destinations: &mut HashSet<String>,
 ) -> PathBuf {
-    if !seen_destinations.contains(&candidate) {
-        seen_destinations.insert(candidate.clone());
+    let key = path_collision_key(&candidate);
+    if !seen_destinations.contains(&key) {
+        seen_destinations.insert(key);
         return candidate;
     }
 
@@ -114,27 +166,181 @@ fn disambiguate_dest_path(
             None => format!("{}_{}", stem, counter),
         };
         let new_path = parent.join(new_name);
-        if !seen_destinations.contains(&new_path) {
-            seen_destinations.insert(new_path.clone());
+        let new_key = path_collision_key(&new_path);
+        if !seen_destinations.contains(&new_key) {
+            seen_destinations.insert(new_key);
             return new_path;
         }
         counter += 1;
     }
 }
 
-/// Commit staged files to their final destinations and clean up staging directory.
+/// Safely unlink an existing file, breaking hardlinks or symlinks without mutating outside targets' attributes.
+#[cfg(windows)]
+fn safe_unlink_file(path: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+
+    if let Ok(meta) = fs::symlink_metadata(path) {
+        if meta.file_type().is_symlink() {
+            return fs::remove_file(path);
+        }
+    }
+
+    #[repr(C)]
+    struct FileDispositionInfoEx {
+        flags: u32,
+    }
+    const FILE_DISPOSITION_INFO_EX: i32 = 21;
+    const FILE_DISPOSITION_FLAG_DELETE: u32 = 0x00000001;
+    const FILE_DISPOSITION_FLAG_POSIX_SEMANTICS: u32 = 0x00000002;
+    const FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE: u32 = 0x00000010;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateFileW(
+            lpFileName: *const u16,
+            dwDesiredAccess: u32,
+            dwShareMode: u32,
+            lpSecurityAttributes: *mut std::ffi::c_void,
+            dwCreationDisposition: u32,
+            dwFlagsAndAttributes: u32,
+            hTemplateFile: *mut std::ffi::c_void,
+        ) -> *mut std::ffi::c_void;
+        fn SetFileInformationByHandle(
+            hFile: *mut std::ffi::c_void,
+            FileInformationClass: i32,
+            lpFileInformation: *const std::ffi::c_void,
+            dwBufferSize: u32,
+        ) -> i32;
+        fn CloseHandle(hObject: *mut std::ffi::c_void) -> i32;
+    }
+
+    const DELETE: u32 = 0x00010000;
+    const FILE_SHARE_READ: u32 = 1;
+    const FILE_SHARE_WRITE: u32 = 2;
+    const FILE_SHARE_DELETE: u32 = 4;
+    const OPEN_EXISTING: u32 = 3;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x02000000;
+
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            DELETE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null_mut(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            std::ptr::null_mut(),
+        )
+    };
+
+    if handle != -1isize as *mut std::ffi::c_void && !handle.is_null() {
+        let info = FileDispositionInfoEx {
+            flags: FILE_DISPOSITION_FLAG_DELETE
+                | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS
+                | FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
+        };
+        let res = unsafe {
+            SetFileInformationByHandle(
+                handle,
+                FILE_DISPOSITION_INFO_EX,
+                &info as *const _ as *const std::ffi::c_void,
+                std::mem::size_of::<FileDispositionInfoEx>() as u32,
+            )
+        };
+        unsafe { CloseHandle(handle) };
+        if res != 0 {
+            return Ok(());
+        }
+    }
+
+    if let Ok(meta) = path.metadata() {
+        let mut perms = meta.permissions();
+        if perms.readonly() {
+            #[allow(clippy::permissions_set_readonly_false)]
+            perms.set_readonly(false);
+            let _ = fs::set_permissions(path, perms);
+        }
+    }
+    fs::remove_file(path)
+}
+
+#[cfg(not(windows))]
+fn safe_unlink_file(path: &Path) -> std::io::Result<()> {
+    fs::remove_file(path)
+}
+
+/// Commit staged files to their final destinations with atomic validation.
+/// If any file/directory type collision exists, aborts before mutating user files.
 fn commit_staged_extraction(
     dirs_to_create: Vec<PathBuf>,
     staged_files: Vec<StagedFile>,
     staging_dir: &Path,
+    target_root: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    for dir in dirs_to_create {
-        if dir.is_file() {
-            let _ = fs::remove_file(&dir);
+    // 1. Pre-flight check on directories
+    for dir in &dirs_to_create {
+        if dir.exists() && dir.is_file() {
+            let _ = fs::remove_dir_all(staging_dir);
+            return Err(format!(
+                "Cannot extract directory '{}': an existing file with the same name already exists",
+                dir.display()
+            )
+            .into());
         }
+        let mut curr = dir.parent();
+        while let Some(parent) = curr {
+            if parent == target_root {
+                break;
+            }
+            if parent.exists() && parent.is_file() {
+                let _ = fs::remove_dir_all(staging_dir);
+                return Err(format!(
+                    "Cannot extract directory '{}': ancestor path '{}' is an existing file",
+                    dir.display(),
+                    parent.display()
+                )
+                .into());
+            }
+            curr = parent.parent();
+        }
+    }
+
+    // 2. Pre-flight check on staged files
+    for staged in &staged_files {
+        if staged.final_dest.exists() && staged.final_dest.is_dir() {
+            let _ = fs::remove_dir_all(staging_dir);
+            return Err(format!(
+                "Cannot extract file '{}': an existing directory with the same name already exists",
+                staged.final_dest.display()
+            )
+            .into());
+        }
+        let mut curr = staged.final_dest.parent();
+        while let Some(parent) = curr {
+            if parent == target_root {
+                break;
+            }
+            if parent.exists() && parent.is_file() {
+                let _ = fs::remove_dir_all(staging_dir);
+                return Err(format!(
+                    "Cannot extract file '{}': ancestor path '{}' is an existing file",
+                    staged.final_dest.display(),
+                    parent.display()
+                )
+                .into());
+            }
+            curr = parent.parent();
+        }
+    }
+
+    // 3. Pre-flight passed: apply directories
+    for dir in dirs_to_create {
         fs::create_dir_all(&dir)?;
     }
 
+    // 4. Move staged files into position
     for staged in staged_files {
         if let Some(parent) = staged.final_dest.parent() {
             if !parent.exists() {
@@ -142,21 +348,8 @@ fn commit_staged_extraction(
             }
         }
 
-        // Break hardlinks or leaf symlinks without mutating outside targets
         if staged.final_dest.exists() || fs::symlink_metadata(&staged.final_dest).is_ok() {
-            if let Ok(meta) = staged.final_dest.metadata() {
-                let mut perms = meta.permissions();
-                if perms.readonly() {
-                    #[allow(clippy::permissions_set_readonly_false)]
-                    perms.set_readonly(false);
-                    let _ = fs::set_permissions(&staged.final_dest, perms);
-                }
-            }
-            if staged.final_dest.is_dir() {
-                let _ = fs::remove_dir_all(&staged.final_dest);
-            } else {
-                let _ = fs::remove_file(&staged.final_dest);
-            }
+            safe_unlink_file(&staged.final_dest)?;
         }
 
         fs::rename(&staged.temp_path, &staged.final_dest)?;
@@ -234,9 +427,8 @@ fn extract_zip_archive(
         (output_base.to_path_buf(), false)
     };
 
-    let target_dir_existed_before = target_dir.exists();
-    fs::create_dir_all(&target_dir)?;
-    let resolved_target = target_dir.canonicalize().unwrap_or_else(|_| target_dir.clone());
+    let (resolved_target, target_dir_existed_before) =
+        resolve_and_verify_target_dir(output_base, &target_dir)?;
 
     let staging_token = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -285,7 +477,6 @@ fn extract_zip_archive(
                 || normalized == ".DS_Store"
                 || normalized.ends_with("/Thumbs.db")
                 || normalized == "Thumbs.db"
-                || normalized.contains(".mothzip_stage_")
             {
                 continue;
             }
@@ -306,11 +497,10 @@ fn extract_zip_archive(
 
                 let mut outfile = File::create(&stage_file_path)?;
 
-                // Defend against deceptive stream zip-bombs and clean up on mid-stream failure
                 let max_entry_bytes = entry.size() + 4096;
                 let mut limited = (&mut entry).take(max_entry_bytes + 1);
-                let written = io::copy(&mut limited, &mut outfile).map_err(|e| {
-                    format!("Extraction error on '{}': {}", raw_name, e)
+                let written = io::copy(&mut limited, &mut outfile).map_err(|e| -> Box<dyn std::error::Error> {
+                    format!("Extraction error on '{}': {}", raw_name, e).into()
                 })?;
 
                 if written > max_entry_bytes {
@@ -345,18 +535,18 @@ fn extract_zip_archive(
     if let Err(e) = stage_result {
         let _ = fs::remove_dir_all(&staging_dir);
         if !target_dir_existed_before {
-            let _ = fs::remove_dir(&target_dir);
+            let _ = fs::remove_dir(&resolved_target);
         }
         return Err(e);
     }
 
     let extracted_files = staged_files.len();
-    commit_staged_extraction(dirs_to_create, staged_files, &staging_dir)?;
+    commit_staged_extraction(dirs_to_create, staged_files, &staging_dir, &resolved_target)?;
 
     Ok(ExtractionSummary {
         extracted_files,
         extracted_bytes,
-        target_dir,
+        target_dir: resolved_target,
         smart_adjusted,
     })
 }
@@ -391,9 +581,8 @@ fn extract_tar_archive(
         (output_base.to_path_buf(), false)
     };
 
-    let target_dir_existed_before = target_dir.exists();
-    fs::create_dir_all(&target_dir)?;
-    let resolved_target = target_dir.canonicalize().unwrap_or_else(|_| target_dir.clone());
+    let (resolved_target, target_dir_existed_before) =
+        resolve_and_verify_target_dir(output_base, &target_dir)?;
 
     let staging_token = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -434,7 +623,6 @@ fn extract_tar_archive(
                 || normalized.starts_with("._")
                 || normalized.contains("/._")
                 || normalized == "pax_global_header"
-                || normalized.contains(".mothzip_stage_")
             {
                 continue;
             }
@@ -517,23 +705,23 @@ fn extract_tar_archive(
     if let Err(e) = stage_result {
         let _ = fs::remove_dir_all(&staging_dir);
         if !target_dir_existed_before {
-            let _ = fs::remove_dir(&target_dir);
+            let _ = fs::remove_dir(&resolved_target);
         }
         return Err(e);
     }
 
     let extracted_files = staged_files.len();
-    commit_staged_extraction(dirs_to_create, staged_files, &staging_dir)?;
+    commit_staged_extraction(dirs_to_create, staged_files, &staging_dir, &resolved_target)?;
 
     Ok(ExtractionSummary {
         extracted_files,
         extracted_bytes,
-        target_dir,
+        target_dir: resolved_target,
         smart_adjusted,
     })
 }
 
-/// Extract a single .gz archive (plain gzip)
+/// Extract a single .gz archive (plain gzip, multi-member compliant)
 fn extract_gz_archive(
     archive_path: &Path,
     output_base: &Path,
@@ -547,9 +735,8 @@ fn extract_gz_archive(
         output_base.to_path_buf()
     };
 
-    let target_dir_existed_before = target_dir.exists();
-    fs::create_dir_all(&target_dir)?;
-    let resolved_target = target_dir.canonicalize().unwrap_or_else(|_| target_dir.clone());
+    let (resolved_target, target_dir_existed_before) =
+        resolve_and_verify_target_dir(output_base, &target_dir)?;
 
     let final_dest = sanitize_entry_path(&resolved_target, &archive_stem)?;
     verify_safe_ancestors(&final_dest, &resolved_target)?;
@@ -563,7 +750,7 @@ fn extract_gz_archive(
     let stage_file_path = staging_dir.join("0.tmp");
 
     let file = File::open(archive_path)?;
-    let mut gz = flate2::read::GzDecoder::new(file);
+    let mut gz = flate2::read::MultiGzDecoder::new(file);
 
     let stage_result: Result<u64, Box<dyn std::error::Error>> = (|| {
         let mut outfile = File::create(&stage_file_path)?;
@@ -582,7 +769,7 @@ fn extract_gz_archive(
         Err(e) => {
             let _ = fs::remove_dir_all(&staging_dir);
             if !target_dir_existed_before {
-                let _ = fs::remove_dir(&target_dir);
+                let _ = fs::remove_dir(&resolved_target);
             }
             return Err(e);
         }
@@ -594,12 +781,12 @@ fn extract_gz_archive(
         mtime: None,
     }];
 
-    commit_staged_extraction(Vec::new(), staged_files, &staging_dir)?;
+    commit_staged_extraction(Vec::new(), staged_files, &staging_dir, &resolved_target)?;
 
     Ok(ExtractionSummary {
         extracted_files: 1,
         extracted_bytes,
-        target_dir,
+        target_dir: resolved_target,
         smart_adjusted: force_subfolder,
     })
 }
