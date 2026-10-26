@@ -29,7 +29,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     PostMessageW, PostQuitMessage, RegisterClassExW, SendMessageW, SetWindowLongPtrW, SetWindowPos,
     SetWindowTextW, ShowWindow, TranslateAcceleratorW, TranslateMessage, UnregisterClassW, ACCEL,
     CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CW_USEDEFAULT, FVIRTKEY, GWLP_USERDATA, HACCEL, HMENU,
-    IDC_ARROW, IDI_APPLICATION, MF_BYCOMMAND, MF_ENABLED, MF_GRAYED, MF_POPUP, MF_SEPARATOR,
+    IDC_ARROW, MF_BYCOMMAND, MF_ENABLED, MF_GRAYED, MF_POPUP, MF_SEPARATOR,
     MF_STRING, MSG, PM_REMOVE, SM_CYMENU, SWP_NOMOVE, SWP_NOZORDER, SW_SHOW, WM_CLOSE, WM_COMMAND,
     WM_CREATE, WM_DESTROY, WM_QUIT, WM_SETFONT, WM_SETREDRAW, WM_SIZE, WNDCLASSEXW, WS_CHILD,
     WS_OVERLAPPEDWINDOW, WS_VISIBLE,
@@ -329,8 +329,9 @@ pub fn open_archive_window(request: &BrowseRequest) -> Result<(), Box<dyn std::e
     class.style = CS_HREDRAW | CS_VREDRAW;
     class.lpfnWndProc = Some(window_proc);
     class.hInstance = instance;
-    // SAFETY: both loads use the documented predefined-resource identifiers.
-    class.hIcon = unsafe { LoadIconW(std::ptr::null_mut(), IDI_APPLICATION) };
+    // SAFETY: resource 1 is the app icon embedded by build.rs in this module.
+    class.hIcon = unsafe { LoadIconW(instance, 1usize as *const u16) };
+    class.hIconSm = class.hIcon;
     // SAFETY: as above; the arrow cursor is a shared system resource.
     class.hCursor = unsafe { LoadCursorW(std::ptr::null_mut(), IDC_ARROW) };
     class.hbrBackground = (COLOR_WINDOW + 1) as isize as HBRUSH;

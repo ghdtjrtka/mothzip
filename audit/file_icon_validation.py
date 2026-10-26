@@ -27,9 +27,11 @@ def resource(kind,identity):
     return ctypes.string_at(pointer,kernel.SizeofResource(module,handle))
 results=[]
 try:
-    for index,extension in enumerate(['archive',*extensions]):
-        name=extension.removeprefix('.');identity=base_id+index
-        source=(workspace/'assets/file-icons'/f'{name}.ico').read_bytes()
+    icons=[('app',1,workspace/'assets/moth.ico')]
+    icons.extend((extension,base_id+index,workspace/'assets/file-icons'/f'{extension.removeprefix(".")}.ico')
+                 for index,extension in enumerate(['archive',*extensions]))
+    for extension,identity,path in icons:
+        source=path.read_bytes()
         group=resource(14,identity)
         _,kind,count=struct.unpack_from('<HHH',group);assert kind==1
         source_count=struct.unpack_from('<H',source,4)[0];assert count==source_count

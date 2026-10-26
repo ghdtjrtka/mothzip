@@ -10,6 +10,7 @@ $extensions = @([regex]::Matches($list, '"(\.[^"]+)"') | ForEach-Object { $_.Gro
 $output = Join-Path $Workspace 'assets\file-icons'
 [IO.Directory]::CreateDirectory($output) | Out-Null
 $moth = [Drawing.Image]::FromFile((Join-Path $Workspace 'assets\moth_icon.png'))
+$cocoon = [Drawing.Image]::FromFile((Join-Path $Workspace 'assets\cocoon_icon.png'))
 $sizes = @(16,20,24,32,40,48,64,96,128,256)
 $ink = [Drawing.ColorTranslator]::FromHtml('#3B2922')
 $gold = [Drawing.ColorTranslator]::FromHtml('#DDA73E')
@@ -36,10 +37,12 @@ function Paint-Icon([string]$Label,[int]$Size) {
         $graphics.SmoothingMode = [Drawing.Drawing2D.SmoothingMode]::AntiAlias
         $compound = $Label.Contains('.')
         $smallLabel = if($compound) { $Label.Split('.')[-1] } else { $Label }
-        if ($Size -le 24) {
+        if (-not $Label) {
+            $graphics.DrawImage($moth,[Drawing.Rectangle]::new(0,0,$Size,$Size))
+        } elseif ($Size -le 24) {
             $footerHeight = if($Size -le 20) {7} else {8}
             $bodyHeight = $Size - $footerHeight + 1
-            $graphics.DrawImage($moth,[Drawing.RectangleF]::new(0,-1,$Size,$bodyHeight+1))
+            $graphics.DrawImage($cocoon,[Drawing.RectangleF]::new(0,-1,$Size,$bodyHeight+1))
             $brush = [Drawing.SolidBrush]::new($ink)
             $graphics.FillRectangle($brush,0,$Size-$footerHeight,$Size,$footerHeight);$brush.Dispose()
             $graphics.SmoothingMode = [Drawing.Drawing2D.SmoothingMode]::None
@@ -58,7 +61,7 @@ function Paint-Icon([string]$Label,[int]$Size) {
         } else {
             $footerHeight = [Math]::Ceiling($Size * $(if($compound){0.31}else{0.23}))
             $footerTop = $Size-$footerHeight-1
-            $graphics.DrawImage($moth,[Drawing.RectangleF]::new(0,-$Size*0.025,$Size,$footerTop+$Size*0.06))
+            $graphics.DrawImage($cocoon,[Drawing.RectangleF]::new(0,-$Size*0.025,$Size,$footerTop+$Size*0.06))
             $radius = $footerHeight*0.15
             $rectangle = [Drawing.RectangleF]::new(1,$footerTop,$Size-2,$footerHeight)
             $path = [Drawing.Drawing2D.GraphicsPath]::new()
@@ -83,17 +86,18 @@ function Paint-Icon([string]$Label,[int]$Size) {
     return ,$image
 }
 
-function Write-Icon([string]$Name,[string]$Label) {
+function Write-Icon([string]$Name,[string]$Label,[switch]$App) {
     $frames = @()
     foreach($size in $sizes) {
         $image = Paint-Icon $Label $size
         $stream = [IO.MemoryStream]::new()
         $image.Save($stream,[Drawing.Imaging.ImageFormat]::Png)
         $frames += ,$stream.ToArray()
-        if($size -eq 256) {$image.Save((Join-Path $output ($Name+'.png')),[Drawing.Imaging.ImageFormat]::Png)}
+        if($size -eq 256 -and -not $App) {$image.Save((Join-Path $output ($Name+'.png')),[Drawing.Imaging.ImageFormat]::Png)}
         $stream.Dispose();$image.Dispose()
     }
-    $stream = [IO.File]::Create((Join-Path $output ($Name+'.ico')))
+    $directory = if($App){Join-Path $Workspace 'assets'}else{$output}
+    $stream = [IO.File]::Create((Join-Path $directory ($Name+'.ico')))
     $writer = [IO.BinaryWriter]::new($stream)
     try {
         $writer.Write([uint16]0);$writer.Write([uint16]1);$writer.Write([uint16]$sizes.Count)
@@ -107,12 +111,13 @@ function Write-Icon([string]$Name,[string]$Label) {
         }
         foreach($frame in $frames){$writer.Write([byte[]]$frame)}
     } finally { $writer.Dispose();$stream.Dispose() }
-    # Editable layout source; the existing brand artwork is referenced without alteration.
-    $lines = if($Label.Contains('.')){$Label.Split('.')}else{@($Label)}
+    if($App){return}
+    # Editable layout source references the same cocoon artwork as the app icon.
+    $lines = @(if($Label.Contains('.')){$Label.Split('.')}else{$Label})
     $footer = if($lines.Count -gt 1){80}else{59}
     $top = 255-$footer
     $svg = '<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">' +
-        '<image href="../moth_icon.png" x="0" y="-6" width="256" height="'+($top+15)+'" preserveAspectRatio="none"/>' +
+        '<image href="../cocoon_icon.png" x="0" y="-6" width="256" height="'+($top+15)+'" preserveAspectRatio="none"/>' +
         '<rect x="1" y="'+$top+'" width="254" height="'+$footer+'" rx="9" fill="#3B2922" stroke="#DDA73E" stroke-width="2"/>'
     for($i=0;$i -lt $lines.Count;$i++) {
         $font = if($lines.Count -gt 1){32}else{42}
@@ -123,6 +128,7 @@ function Write-Icon([string]$Name,[string]$Label) {
 }
 
 try {
+    Write-Icon 'moth' '' -App
     Write-Icon 'archive' 'ARC'
     foreach($extension in $extensions){$name=$extension.TrimStart('.');Write-Icon $name $name.ToUpperInvariant()}
     $columns = 5;$cell = 156;$rows = [int][Math]::Ceiling($extensions.Count/$columns)
@@ -139,5 +145,5 @@ try {
     }
     $preview.Save((Join-Path $output 'preview.png'),[Drawing.Imaging.ImageFormat]::Png)
     $format.Dispose();$brush.Dispose();$font.Dispose();$graphics.Dispose();$preview.Dispose()
-} finally {$moth.Dispose()}
+} finally {$moth.Dispose();$cocoon.Dispose()}
 Write-Output "Generated $($extensions.Count) format icons plus a generic archive icon."
