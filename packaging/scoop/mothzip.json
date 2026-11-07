@@ -6,7 +6,7 @@
   "architecture": {
     "64bit": {
       "url": "https://github.com/ghdtjrtka/mothzip/releases/download/v1.2.5/mothzip-1.2.5-windows-x64.zip",
-      "hash": "94469d6c5bf5155fe0b57c041c52d3e6fced4082e79e93a9bab6399a24466f48"
+      "hash": "5555d1c3ebac7381b9f643d6e8d8e7ddaca1e6fcd003037bd02c5d1f9749bd5c"
     }
   },
   "bin": "mothzip.exe",
