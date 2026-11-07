@@ -9,7 +9,7 @@ NestedInstallerFiles:
 Installers:
 - Architecture: x64
   InstallerUrl: https://github.com/ghdtjrtka/mothzip/releases/download/v1.2.5/mothzip-1.2.5-windows-x64.zip
-  InstallerSha256: 21E0A90AB46637939B2DA18A1B4D41E8D191CCBE1D9D253BDFDE1D9DDE9C5FC5
+  InstallerSha256: 94469D6C5BF5155FE0B57C041C52D3E6FCED4082E79E93A9BAB6399A24466F48
   Scope: user
 ManifestType: installer
 ManifestVersion: 1.6.0
