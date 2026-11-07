@@ -6,7 +6,9 @@ An ad-free archive CLI for Windows, with JSON output for agents and Explorer act
 interface: `--json` results, exit codes `0`/`1`/`2`, `--non-interactive`, and a `--max-bytes`
 budget on every path that expands payload (`peek` lists structure without decompressing and is not bounded). Explorer adds a three-item menu and a small browsing window that lists,
 extracts and checks an archive. Scope is deliberately narrow — no RAR creation, no repair, no
-ALZ/EGG archives, no preview pane. Building from source and running the release gate:
+ALZ/EGG archives, no preview pane. This is also a personal tool: it carries what its author
+actually uses, so a feature that was never used is absent by decision, not by oversight. Building
+from source and running the release gate:
 [CONTRIBUTING.md](CONTRIBUTING.md).
 
 [한국어 안내](README.ko.md)
