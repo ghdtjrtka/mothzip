@@ -29,6 +29,16 @@ for ext in ('zip','tar','tar.gz'):
     out=root/('missing-'+ext);out.mkdir();(out/'sentinel.txt').write_bytes(b'ORIGINAL');r=call('unpack',archive,'--member','absent','-o',out)
     record('missing-atomic-'+ext,r['exit']==1 and inventory(out)=={'sentinel.txt':b'ORIGINAL'.hex()},[r])
 
+# 7z member selection: the tool writes a non-solid 7z, measured as two similar 11 KiB members
+# costing 94% of their separate archives, so this covers a later member of a multi-member 7z rather
+# than the solid decode path a RAR fixture would have covered.
+d=root/'seven-member-source';d.mkdir()
+(d/'first.txt').write_bytes(b'FIRST');(d/'second.txt').write_bytes(b'SECOND')
+seven=root/'multiple.7z';packed=call('pack',seven,d/'first.txt',d/'second.txt')
+out=root/'seven-member-out';selected=call('unpack',seven,'--member','second.txt','-o',out)
+actual={name:bytes.fromhex(value) for name,value in inventory(out).items()}
+record('later-member-7z',packed['exit']==0 and selected['exit']==0 and actual=={'second.txt':b'SECOND'},[packed,selected])
+
 # The RAR probes need a fixture made by a RAR creator, which this tool does not implement and the
 # repository cannot ship (audit/runs is not tracked). When that fixture is absent the probes are
 # reported as skipped instead of failing the gate.
